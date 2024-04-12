@@ -26,7 +26,11 @@
 #define O_TMPFILE_MASK	(__O_TMPFILE | O_DIRECTORY | O_CREAT)
 #define O_NDELAY		O_NONBLOCK
 
-#define __O_DELETE		040000000 /* Internal mode */
+/* Internal modes */
+#define INTERNAL_O_TMP			001000000	/* Temporary file, delete on close */
+#define INTERNAL_O_SPECIAL		002000000	/* Open/create special file (symlink, sockets, etc) */
+#define INTERNAL_O_DELETE		004000000	/* Open with DELETE permission */
+#define INTERNAL_O_NOINHERIT	010000000	/* Any NT handles created should be non inheritable */
 
 #define AT_FDCWD				-100    /* Special value used to indicate openat should use the current working directory. */
 #define AT_SYMLINK_NOFOLLOW     0x100   /* Do not follow symbolic links.  */

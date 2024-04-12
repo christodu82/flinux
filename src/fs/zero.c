@@ -17,19 +17,17 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#pragma once
+#include <fs/zero.h>
 
-#include <fs/file.h>
-#include <fs/virtual.h>
+static size_t zero_read(int tag, void *buf, size_t count)
+{
+	RtlZeroMemory(buf, count);
+	return count;
+}
 
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
+static size_t zero_write(int tag, const void *buf, size_t count)
+{
+	return count;
+}
 
-void console_init();
-int console_fork(HANDLE process);
-void console_afterfork();
-
-struct virtualfs_custom_desc console_desc;
-size_t console_read(void *buf, size_t count);
-size_t console_write(const void *buf, size_t count);
-struct file *console_alloc();
+struct virtualfs_char_desc zero_desc = VIRTUALFS_CHAR(mkdev(1, 5), zero_read, zero_write);

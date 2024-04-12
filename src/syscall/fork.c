@@ -24,13 +24,17 @@
 #include <syscall/fork.h>
 #include <syscall/mm.h>
 #include <syscall/process.h>
+#include <syscall/process_info.h>
 #include <syscall/syscall.h>
 #include <syscall/tls.h>
+#include <flags.h>
 #include <heap.h>
 #include <log.h>
+#include <shared.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <ntdll.h>
 
 /* Fork process
  *
@@ -58,6 +62,8 @@ __declspec(noreturn) static void fork_child()
 {
 	install_syscall_handler();
 	mm_afterfork_child();
+	flags_afterfork_child();
+	shared_afterfork_child();
 	heap_afterfork_child();
 	signal_afterfork_child();
 	process_afterfork_child(fork->stack_base, fork->pid);
@@ -142,8 +148,8 @@ void fork_init()
  o CLONE_NEWNS
  o CLONE_SYSVSEM
  * CLONE_SETTLS
- o CLONE_PARENT_SETTID
- o CLONE_CHILD_CLEARTID
+ * CLONE_PARENT_SETTID
+ * CLONE_CHILD_CLEARTID
  o CLONE_DETACHED
  o CLONE_UNTRACED
  * CLONE_CHILD_SETTID
@@ -171,7 +177,13 @@ static pid_t fork_process(struct syscall_context *context, unsigned long flags, 
 	if (!tls_fork(info.hProcess))
 		goto fail;
 
+	if (!vfs_fork(info.hProcess, info.dwProcessId))
+		goto fail;
+
 	if (!mm_fork(info.hProcess))
+		goto fail;
+
+	if (!shared_fork(info.hProcess))
 		goto fail;
 
 	if (!heap_fork(info.hProcess))
@@ -183,9 +195,6 @@ static pid_t fork_process(struct syscall_context *context, unsigned long flags, 
 	if (!process_fork(info.hProcess))
 		goto fail;
 
-	if (!vfs_fork(info.hProcess))
-		goto fail;
-
 	if (!exec_fork(info.hProcess))
 		goto fail;
 
@@ -193,15 +202,17 @@ static pid_t fork_process(struct syscall_context *context, unsigned long flags, 
 
 	/* Set up fork_info in child process */
 	void *stack_base = process_get_stack_base();
-	WriteProcessMemory(info.hProcess, &fork->context, context, sizeof(struct syscall_context), NULL);
-	WriteProcessMemory(info.hProcess, &fork->stack_base, &stack_base, sizeof(stack_base), NULL);
-	WriteProcessMemory(info.hProcess, &fork->pid, &pid, sizeof(pid_t), NULL);
+	NtWriteVirtualMemory(info.hProcess, &fork->context, context, sizeof(struct syscall_context), NULL);
+	NtWriteVirtualMemory(info.hProcess, &fork->stack_base, &stack_base, sizeof(stack_base), NULL);
+	NtWriteVirtualMemory(info.hProcess, &fork->pid, &pid, sizeof(pid_t), NULL);
 	if (flags & CLONE_CHILD_SETTID)
-		WriteProcessMemory(info.hProcess, &fork->ctid, &ctid, sizeof(void*), NULL);
+		NtWriteVirtualMemory(info.hProcess, &fork->ctid, &ctid, sizeof(void*), NULL);
+	if (flags & CLONE_PARENT_SETTID)
+		*(pid_t*)ptid = pid;
 
 	/* Copy stack */
 	VirtualAllocEx(info.hProcess, stack_base, STACK_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-	WriteProcessMemory(info.hProcess, (LPVOID)context->esp, (LPCVOID)context->esp,
+	NtWriteVirtualMemory(info.hProcess, (PVOID)context->esp, (PVOID)context->esp,
 		(SIZE_T)((char *)stack_base + STACK_SIZE - context->esp), NULL);
 	ResumeThread(info.hThread);
 	CloseHandle(info.hThread);
@@ -212,6 +223,8 @@ static pid_t fork_process(struct syscall_context *context, unsigned long flags, 
 	process_afterfork_parent();
 	signal_afterfork_parent();
 	heap_afterfork_parent();
+	shared_afterfork_parent();
+	flags_afterfork_parent();
 	mm_afterfork_parent();
 
 	log_info("Child pid: %d, win_pid: %d", pid, info.dwProcessId);
@@ -231,10 +244,12 @@ static DWORD WINAPI fork_thread_callback(void *data)
 	log_init_thread();
 	dbt_init_thread();
 	process_thread_entry(info->pid);
-	if (info->ctid)
-		*(pid_t *)info->ctid = info->pid;
 	if (info->flags & CLONE_SETTLS)
 		tls_set_thread_area(&info->tls_data);
+	if (info->flags & CLONE_CHILD_CLEARTID)
+		current_thread->clear_tid = info->ctid;
+	else
+		current_thread->clear_tid = NULL;
 	dbt_update_tls(info->gs);
 	struct syscall_context context = info->context;
 	context.eax = 0;
@@ -248,13 +263,16 @@ static pid_t fork_thread(struct syscall_context *context, void *child_stack, uns
 	struct fork_info *info = VirtualAlloc(NULL, sizeof(struct fork_info), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 	DWORD win_tid;
 	HANDLE handle = CreateThread(NULL, 0, fork_thread_callback, info, CREATE_SUSPENDED, &win_tid);
-	pid_t pid = process_init_thread(win_tid);
+	pid_t pid = process_create_thread(win_tid);
 	info->context = *context;
 	info->context.esp = (DWORD)child_stack;
 	info->pid = pid;
+	info->ctid = ctid;
 	info->flags = flags;
 	if (flags & CLONE_CHILD_SETTID)
-		info->ctid = ctid;
+		*(pid_t *)ctid = pid;
+	if (flags & CLONE_PARENT_SETTID)
+		*(pid_t *)ptid = pid;
 	info->gs = dbt_get_gs();
 	if (flags & CLONE_SETTLS)
 		info->tls_data = *(struct user_desc *)context->esi;

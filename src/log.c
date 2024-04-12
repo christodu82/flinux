@@ -20,6 +20,7 @@
 #include <common/types.h>
 #include <log.h>
 #include <vsprintf.h>
+#include <win7compat.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -104,11 +105,17 @@ static void log_internal(int type, char typech, const char *format, va_list ap)
 	packet->type = type;
 	FILETIME tf;
 	SYSTEMTIME ts;
-	GetSystemTimePreciseAsFileTime(&tf);
-	FileTimeToLocalFileTime(&tf, &tf);
-	FileTimeToSystemTime(&tf, &ts);
-	packet->len = ksprintf(packet->text, "[%02u:%02u:%02u.%03u] (%c%c) ", ts.wHour,
-		ts.wMinute, ts.wSecond, ts.wMilliseconds, typech, typech);
+	win7compat_GetSystemTimePreciseAsFileTime(&tf);
+	/* Convert FILETIME to human readable text */
+	uint64_t time = ((uint64_t)tf.dwHighDateTime << 32ULL) + tf.dwLowDateTime;
+	/* FILETIME is in 100-nanosecond units */
+	uint64_t seconds = (time / 10'000'000ULL);
+	int nano = (int)(time % 10'000'000ULL);
+	int sec = (int)(seconds % 60);
+	int min = (int)((seconds / 60) % 60);
+	int hr = (int)((seconds / 3600) % 24);
+	packet->len = ksprintf(packet->text, "[%02u:%02u:%02u.%07u] (%c%c) ",
+		hr, min, sec, nano, typech, typech);
 	packet->len += kvsprintf(packet->text + packet->len, format, ap);
 	packet->packet_size = sizeof(struct packet) + packet->len;
 	DWORD bytes_written;
@@ -146,3 +153,15 @@ void log_error_internal(const char *format, ...)
 	va_start(ap, format);
 	log_internal(LOG_ERROR, 'E', format, ap);
 }
+
+#ifdef _DEBUG
+
+void log_assert_internal(const char *format, ...)
+{
+	va_list ap;
+	va_start(ap, format);
+	log_internal(LOG_DEBUG, 'D', format, ap);
+	process_exit(LOG_ASSERT_EXIT, 0);
+}
+
+#endif

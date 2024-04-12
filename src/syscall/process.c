@@ -24,6 +24,7 @@
 #include <common/sysinfo.h>
 #include <common/wait.h>
 #include <fs/virtual.h>
+#include <syscall/futex.h>
 #include <syscall/mm.h>
 #include <syscall/process.h>
 #include <syscall/process_info.h>
@@ -33,6 +34,7 @@
 #include <datetime.h>
 #include <log.h>
 #include <ntdll.h>
+#include <shared.h>
 #include <str.h>
 
 #include <stdbool.h>
@@ -69,12 +71,18 @@ static void process_init_private()
 	for (int i = 0; i < MAX_PROCESS_COUNT; i++)
 		list_add(&process->thread_freelist, &process->threads[i].list);
 	/* Initialize shared process table related data structures */
-	process_shared = (volatile struct process_shared_data *)mm_global_shared_alloc(sizeof(struct process_shared_data));
-	SECURITY_ATTRIBUTES attr;
-	attr.nLength = sizeof(SECURITY_ATTRIBUTES);
-	attr.bInheritHandle = TRUE;
-	attr.lpSecurityDescriptor = NULL;
-	process->shared_mutex = CreateMutexW(&attr, FALSE, L"flinux_process_shared_mutex");
+	process_shared = (volatile struct process_shared_data *)shared_alloc(sizeof(struct process_shared_data));
+	UNICODE_STRING shared_mutex_name;
+	RtlInitUnicodeString(&shared_mutex_name, L"process_shared_mutex");
+	OBJECT_ATTRIBUTES oa;
+	InitializeObjectAttributes(&oa, &shared_mutex_name, OBJ_OPENIF, shared_get_object_directory(), NULL);
+	NTSTATUS status;
+	status = NtCreateMutant(&process->shared_mutex, MUTANT_ALL_ACCESS, &oa, FALSE);
+	if (!NT_SUCCESS(status))
+	{
+		log_info("NtCreateMutant() failed, status: %x", status);
+		NtTerminateProcess(NtCurrentProcess(), 1);
+	}
 }
 
 static void process_lock_shared()
@@ -84,7 +92,7 @@ static void process_lock_shared()
 
 static void process_unlock_shared()
 {
-	ReleaseMutex(process->shared_mutex);
+	NtReleaseMutant(process->shared_mutex, NULL);
 }
 
 /* Allocate a new thread structure in process_data */
@@ -165,8 +173,10 @@ void process_init()
 	process->pid = pid;
 	/* Allocate structure for main thread */
 	struct thread *thread = thread_alloc();
+	thread->pid = pid;
 	DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &thread->handle,
 		0, FALSE, DUPLICATE_SAME_ACCESS);
+	NtCreateEvent(&thread->wait_event, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, FALSE);
 	signal_init_thread(thread);
 	current_thread = thread;
 	current_thread->stack_base = VirtualAlloc(NULL, STACK_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
@@ -183,8 +193,10 @@ void process_afterfork_child(void *stack_base, pid_t pid)
 	process_shared->processes[pid].sigwrite = signal_get_process_sigwrite();
 	/* Allocate structure for main thread */
 	struct thread *thread = thread_alloc();
+	thread->pid = pid;
 	DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &thread->handle,
 		0, FALSE, DUPLICATE_SAME_ACCESS);
+	NtCreateEvent(&thread->wait_event, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, FALSE);
 	signal_init_thread(thread);
 	current_thread = thread;
 	current_thread->stack_base = stack_base;
@@ -204,9 +216,11 @@ void process_thread_entry(pid_t tid)
 {
 	AcquireSRWLockExclusive(&process->rw_lock);
 	struct thread *thread = thread_alloc();
+	thread->pid = tid;
 	ReleaseSRWLockExclusive(&process->rw_lock);
 	DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &thread->handle,
 		0, FALSE, DUPLICATE_SAME_ACCESS);
+	NtCreateEvent(&thread->wait_event, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, FALSE);
 	signal_init_thread(thread);
 	current_thread = thread;
 	/* TODO: stack_base */
@@ -253,7 +267,7 @@ pid_t process_init_child(DWORD win_pid, DWORD win_tid, HANDLE process_handle)
 	return pid;
 }
 
-pid_t process_init_thread(DWORD win_tid)
+pid_t process_create_thread(DWORD win_tid)
 {
 	AcquireSRWLockExclusive(&process->rw_lock);
 	/* Allocate a new process table entry */
@@ -275,6 +289,7 @@ pid_t process_init_thread(DWORD win_tid)
 }
 
 /* Caller ensures process rw lock is acquired (shared) */
+/* FIXME: Using shared lock here is incorrect */
 static pid_t process_wait(pid_t pid, int *status, int options, struct rusage *rusage)
 {
 	if (options & WUNTRACED)
@@ -295,13 +310,19 @@ static pid_t process_wait(pid_t pid, int *status, int options, struct rusage *ru
 				if (options & WNOHANG)
 				{
 					if (!proc->terminated)
+					{
+						log_warning("Child not terminated yet.");
 						return -L_ECHILD;
+					}
 				}
 				else
 				{
 					DWORD result = signal_wait(1, &proc->hProcess, INFINITE);
 					if (result == WAIT_INTERRUPTED)
+					{
+						log_warning("Interrupted by signal.");
 						return -L_EINTR;
+					}
 				}
 				/* Decrement semaphore */
 				WaitForSingleObject(signal_get_process_wait_semaphore(), INFINITE);
@@ -425,6 +446,30 @@ __declspec(noreturn) void process_exit(int exit_code, int exit_signal)
 	process_shared->processes[pid].status = PROCESS_ZOMBIE;
 	/* Let Windows release process lock for us */
 	ExitProcess(exit_code);
+}
+
+__declspec(noreturn) void thread_exit(int exit_code, int exit_signal)
+{
+	signal_exit_thread(current_thread);
+	if (current_thread->clear_tid)
+	{
+		if (mm_check_write(current_thread->clear_tid, sizeof(pid_t)))
+		{
+			*current_thread->clear_tid = 0;
+			futex_wake(current_thread->clear_tid, 1);
+		}
+	}
+	NtClose(current_thread->wait_event);
+	process_lock_shared();
+	process_shared->processes[current_thread->pid].status = PROCESS_NOTEXIST;
+	process_shared->processes[current_thread->pid].exit_code = exit_code;
+	process_shared->processes[current_thread->pid].exit_signal = exit_signal;
+	process_unlock_shared();
+	log_shutdown();
+	if (InterlockedDecrement(&process->thread_count) == 0)
+		process_exit(exit_code, exit_signal);
+	else
+		ExitThread(exit_code);
 }
 
 bool process_pid_exist(pid_t pid)
@@ -644,6 +689,9 @@ int process_query(int query_type, char *buf)
 	case PROCESS_QUERY_STAT:
 		return process_get_stat(buf);
 
+	case PROCESS_QUERY_MAPS:
+		return mm_get_maps(buf);
+
 	default:
 		return 0;
 	}
@@ -754,16 +802,7 @@ DEFINE_SYSCALL(getgroups, int, size, gid_t *, list)
 DEFINE_SYSCALL(exit, int, status)
 {
 	log_info("exit(%d)", status);
-	log_shutdown();
-	process_lock_shared();
-	process_shared->processes[current_thread->pid].status = PROCESS_NOTEXIST;
-	process_shared->processes[current_thread->pid].exit_code = status;
-	process_shared->processes[current_thread->pid].exit_signal = 0;
-	process_unlock_shared();
-	if (InterlockedDecrement(&process->thread_count) == 0)
-		process_exit(status, 0);
-	else
-		ExitThread(status);
+	thread_exit(status, 0);
 }
 
 DEFINE_SYSCALL(exit_group, int, status)
@@ -845,32 +884,52 @@ DEFINE_SYSCALL(sysinfo, struct sysinfo *, info)
 	return 0;
 }
 
+static int do_prlimit64(pid_t pid, int resource, const struct rlimit64 *new_limit, struct rlimit64 *old_limit)
+{
+	if (old_limit)
+	{
+		switch (resource)
+		{
+		case RLIMIT_STACK:
+			old_limit->rlim_cur = STACK_SIZE;
+			old_limit->rlim_max = STACK_SIZE;
+			break;
+
+		case RLIMIT_NPROC:
+			log_info("RLIMIT_NPROC: return fake result.");
+			old_limit->rlim_cur = 65536;
+			old_limit->rlim_max = 65536;
+			break;
+
+		case RLIMIT_NOFILE:
+			old_limit->rlim_cur = MAX_FD_COUNT;
+			old_limit->rlim_max = MAX_FD_COUNT;
+			break;
+
+		default:
+			log_error("Unsupported resource: %d", resource);
+			return -L_EINVAL;
+		}
+	}
+	if (new_limit)
+	{
+		log_error("Setting rlimit %d not supported.", resource);
+		return -L_EINVAL;
+	}
+	return 0;
+}
+
 DEFINE_SYSCALL(getrlimit, int, resource, struct rlimit *, rlim)
 {
 	log_info("getrlimit(%d, %p)", resource, rlim);
 	if (!mm_check_write(rlim, sizeof(struct rlimit)))
 		return -L_EFAULT;
-	switch (resource)
+	struct rlimit64 old_limit;
+	int r = do_prlimit64(0, resource, NULL, &old_limit);
+	if (r == 0)
 	{
-	case RLIMIT_STACK:
-		rlim->rlim_cur = STACK_SIZE;
-		rlim->rlim_max = STACK_SIZE;
-		break;
-
-	case RLIMIT_NPROC:
-		log_info("RLIMIT_NPROC: return fake result.");
-		rlim->rlim_cur = 65536;
-		rlim->rlim_max = 65536;
-		break;
-
-	case RLIMIT_NOFILE:
-		rlim->rlim_cur = MAX_FD_COUNT;
-		rlim->rlim_max = MAX_FD_COUNT;
-		break;
-
-	default:
-		log_error("Unsupported resource: %d", resource);
-		return -L_EINVAL;
+		rlim->rlim_cur = old_limit.rlim_cur;
+		rlim->rlim_max = old_limit.rlim_max;
 	}
 	return 0;
 }
@@ -880,12 +939,10 @@ DEFINE_SYSCALL(setrlimit, int, resource, const struct rlimit *, rlim)
 	log_info("setrlimit(%d, %p)", resource, rlim);
 	if (!mm_check_read(rlim, sizeof(struct rlimit)))
 		return -L_EFAULT;
-	switch (resource)
-	{
-	default:
-		log_error("Unsupported resource: %d", resource);
-		return -L_EINVAL;
-	}
+	struct rlimit64 new_limit;
+	new_limit.rlim_cur = rlim->rlim_cur;
+	new_limit.rlim_max = rlim->rlim_max;
+	return do_prlimit64(0, resource, &new_limit, NULL);
 }
 
 DEFINE_SYSCALL(getrusage, int, who, struct rusage *, usage)
@@ -940,7 +997,11 @@ DEFINE_SYSCALL(capset, void *, header, const void *, data)
 DEFINE_SYSCALL(prlimit64, pid_t, pid, int, resource, const struct rlimit64 *, new_limit, struct rlimit64 *, old_limit)
 {
 	log_info("prlimit64(pid=%d, resource=%d, new_limit=%p, old_limit=%p)", pid, resource, new_limit, old_limit);
-	log_error("prlimit64() not implemented.");
+	if (new_limit && !mm_check_read(new_limit, sizeof(struct rlimit64)))
+		return -L_EFAULT;
+	if (old_limit && !mm_check_write(old_limit, sizeof(struct rlimit64)))
+		return -L_EFAULT;
+	do_prlimit64(pid, resource, new_limit, old_limit);
 	return 0;
 }
 
@@ -996,46 +1057,4 @@ DEFINE_SYSCALL(set_tid_address, int *, tidptr)
 	log_info("set_tid_address(tidptr=%p)", tidptr);
 	log_error("clear_child_tid not supported.");
 	return GetCurrentThreadId();
-}
-
-#pragma comment(lib, "synchronization.lib")
-DEFINE_SYSCALL(futex, int *, uaddr, int, op, int, val, const struct timespec *, timeout, int *, uaddr2, int, val3)
-{
-	log_info("futex(%p, %d, %d, %p, %p, %d)", uaddr, op, val, timeout, uaddr2, val3);
-	if (!mm_check_write(uaddr, sizeof(int)))
-		return -L_EACCES;
-	switch (op & FUTEX_CMD_MASK)
-	{
-	case FUTEX_WAIT:
-	{
-		if (timeout && !mm_check_read(timeout, sizeof(struct timespec)))
-			return -L_EFAULT;
-		DWORD time = timeout ? timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000 : INFINITE;
-		if (WaitOnAddress((volatile void *)uaddr, &val, sizeof(int), time))
-			return 0;
-		else
-			return -L_ETIMEDOUT;
-	}
-
-	case FUTEX_WAKE:
-		/* Wake up at most val processes waiting on this futex address */
-		/* TODO: Check whether the logic and return value is correct */
-		val = min(val, process->thread_count);
-		for (int i = 0; i < val; i++)
-			WakeByAddressSingle(uaddr);
-		return val;
-
-	default:
-		log_error("Unsupported futex operation, returning -ENOSYS");
-		return -L_ENOSYS;
-	}
-}
-
-DEFINE_SYSCALL(set_robust_list, struct robust_list_head *, head, int, len)
-{
-	log_info("set_robust_list(head=%p, len=%d)", head, len);
-	if (len != sizeof(struct robust_list_head))
-		log_error("len (%d) != sizeof(struct robust_list_head)", len);
-	log_error("set_robust_list() not supported.");
-	return 0;
 }

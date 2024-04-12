@@ -36,6 +36,7 @@
 #include <syscall/vfs.h>
 #include <datetime.h>
 #include <log.h>
+#include <shared.h>
 #include <str.h>
 
 #define WIN32_LEAN_AND_MEAN
@@ -64,21 +65,125 @@ struct filed
 	int cloexec;
 };
 
+#define FS_WINFS			0
+#define FS_DEVFS			1
+#define FS_PROCFS			2
+#define FS_SYSFS			3
+#define FS_COUNT			4
+#define MAX_MOUNT_POINTS	64
 struct vfs_data
 {
 	SRWLOCK rw_lock;
+	struct file_system *fs[FS_COUNT];
+	HANDLE mount_write_mutex;
 	struct filed filed[MAX_FD_COUNT];
-	struct file_system *fs_first;
 	struct file *cwd;
 	int umask;
 };
 
-static struct vfs_data *vfs;
-
-static void vfs_add(struct file_system *fs)
+struct vfs_shared_data
 {
-	fs->next = vfs->fs_first;
-	vfs->fs_first = fs;
+	volatile int mp_first;
+	volatile int max_key;
+	int root_id; /* ID of root mount point */
+	struct mount_point mounts[MAX_MOUNT_POINTS]; /* Slot 0 is unused */
+};
+
+static struct vfs_data *vfs;
+static struct vfs_shared_data *vfs_shared;
+
+static void copy_mountpoint(const struct mount_point *mp, struct mount_point *out_mp)
+{
+	out_mp->key = mp->key;
+	out_mp->win_path_len = mp->win_path_len;
+	wcscpy(out_mp->win_path, mp->win_path);
+	out_mp->mountpoint_len = mp->mountpoint_len;
+	strcpy(out_mp->mountpoint, mp->mountpoint);
+	out_mp->fs = vfs->fs[mp->fs_id];
+}
+
+/* Internal mount function. Caller should have vfs_mount_write_mutex acquired. */
+static int vfs_mount_unsafe(int fs_id, bool is_system, const WCHAR *win_path, const char *mount_path)
+{
+	log_assert(*mount_path == '/');
+	/* Find an empty slot */
+	for (int i = 1; i < MAX_MOUNT_POINTS; i++)
+		if (!vfs_shared->mounts[i].used)
+		{
+			/* Initialize mount struct */
+			vfs_shared->mounts[i].used = true;
+			vfs_shared->mounts[i].is_system = is_system;
+			vfs_shared->mounts[i].fs_id = fs_id;
+			vfs_shared->mounts[i].key = InterlockedIncrement(&vfs_shared->max_key);
+			if (win_path == NULL)
+			{
+				vfs_shared->mounts[i].win_path_len = 0;
+				vfs_shared->mounts[i].win_path[0] = 0;
+			}
+			else
+			{
+				vfs_shared->mounts[i].win_path_len = wcslen(win_path);
+				wcscpy(vfs_shared->mounts[i].win_path, win_path);
+			}
+			vfs_shared->mounts[i].mountpoint_len = strlen(mount_path);
+			strcpy(vfs_shared->mounts[i].mountpoint, mount_path);
+			
+			/* We have to keep mount points sorted by their POSIX paths in descending order.
+			 * Hence "/home" will be tested before "/" on path resolving.
+			 */
+			/* Find the position to insert this mount point */
+			int prev = 0, cur = vfs_shared->mp_first;
+			while (cur)
+			{
+				int r = strcmp(vfs_shared->mounts[i].mountpoint, vfs_shared->mounts[cur].mountpoint);
+				if (r == 0)
+				{
+					log_error("Mounting to existing mount point \"%s\" not supported yet.",
+						vfs_shared->mounts[i].mountpoint);
+					process_exit(1, 0);
+				}
+				if (r > 0)
+				{
+					/* Insert before current mount point */
+					/* `next' is volatile, and in MSVC volatile means release ordering */
+					vfs_shared->mounts[i].next = cur;
+					if (prev == 0)
+						vfs_shared->mp_first = i;
+					else
+						vfs_shared->mounts[prev].next = i;
+					return true;
+				}
+				prev = cur;
+				cur = vfs_shared->mounts[cur].next;
+			}
+			/* It is less than any of existing mount points, insert after the last one */
+			/* `next' is volatile, and in MSVC volatile means release ordering */
+			vfs_shared->mounts[i].next = 0;
+			if (prev == 0)
+				vfs_shared->mp_first = i;
+			else
+				vfs_shared->mounts[prev].next = i;
+			return i;
+		}
+	return 0;
+}
+
+void vfs_get_root_mountpoint(struct mount_point *mp)
+{
+	copy_mountpoint(&vfs_shared->mounts[vfs_shared->root_id], mp);
+}
+
+bool vfs_get_mountpoint(int key, struct mount_point *mp)
+{
+	for (int i = vfs_shared->mp_first; i; i = vfs_shared->mounts[i].next)
+	{
+		if (vfs_shared->mounts[i].key == key)
+		{
+			copy_mountpoint(&vfs_shared->mounts[i], mp);
+			return true;
+		}
+	}
+	return false;
 }
 
 /* Reference a file, only used on raw file handles not created by sys_open() */
@@ -127,11 +232,73 @@ static void vfs_close(int fd)
 	vfs->filed[fd].cloexec = 0;
 }
 
+static void vfs_shared_init()
+{
+	if (vfs_shared->mp_first > 0)
+	{
+		/* The shared area is already initialized */
+		return;
+	}
+	/* Acquire write mutex first */
+	WaitForSingleObject(vfs->mount_write_mutex, INFINITE);
+	if (vfs_shared->mp_first > 0)
+	{
+		/* It is initialized by another process, quit now */
+		NtReleaseMutant(vfs->mount_write_mutex, NULL);
+		return;
+	}
+	/* Create the initial mount table */
+	/* Get Win32 path of our root directory */
+	HANDLE basedir_handle = CreateFileW(L".", 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+		OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	if (basedir_handle == INVALID_HANDLE_VALUE)
+	{
+		log_error("Open current directory failed.");
+		process_exit(1, 0);
+	}
+	WCHAR basedir[MAX_PATH + 1];
+	DWORD basedir_len = GetFinalPathNameByHandleW(basedir_handle, basedir, MAX_PATH, FILE_NAME_NORMALIZED);
+	CloseHandle(basedir_handle);
+	if (basedir_len > MAX_PATH)
+	{
+		log_error("The path of current directory is too long.");
+		process_exit(1, 0);
+	}
+	basedir[1] = L'?';
+	log_info("Root directory: %S", basedir);
+	vfs_shared->root_id = vfs_mount_unsafe(FS_WINFS, true, basedir, "/");
+	for (char i = 'a'; i <= 'z'; i++)
+	{
+		char mountpoint[3] = { '/', i, 0 };
+		WCHAR winpath[8] = { L'\\', L'?', L'?', L'\\', i - 'a' + 'A', L':', L'\\', 0 };
+		vfs_mount_unsafe(FS_WINFS, true, winpath, mountpoint);
+	}
+	vfs_mount_unsafe(FS_DEVFS, true, NULL, "/dev");
+	vfs_mount_unsafe(FS_PROCFS, true, NULL, "/proc");
+	vfs_mount_unsafe(FS_SYSFS, true, NULL, "/sys");
+	NtReleaseMutant(vfs->mount_write_mutex, NULL);
+}
+
 void vfs_init()
 {
 	log_info("vfs subsystem initializing...");
 	vfs = mm_static_alloc(sizeof(struct vfs_data));
 	InitializeSRWLock(&vfs->rw_lock);
+	/* Create file systems */
+	vfs->fs[FS_WINFS] = winfs_alloc();
+	vfs->fs[FS_DEVFS] = devfs_alloc();
+	vfs->fs[FS_PROCFS] = procfs_alloc();
+	vfs->fs[FS_SYSFS] = sysfs_alloc();
+	/* Create vfs shared area */
+	vfs_shared = shared_alloc(sizeof(struct vfs_shared_data));
+	/* Create vfs mutexex */
+	UNICODE_STRING name;
+	RtlInitUnicodeString(&name, L"vfs_mount_write_mutex");
+	OBJECT_ATTRIBUTES oa;
+	InitializeObjectAttributes(&oa, &name, OBJ_INHERIT | OBJ_OPENIF, shared_get_object_directory(), NULL);
+	NtCreateMutant(&vfs->mount_write_mutex, MUTANT_ALL_ACCESS, &oa, FALSE);
+	vfs_shared_init();
+	/* Create files for standard I/O */
 	struct file *console_in, *console_out;
 	console_init();
 	struct file *console = console_alloc();
@@ -139,12 +306,8 @@ void vfs_init()
 	vfs->filed[0].fd = console;
 	vfs->filed[1].fd = console;
 	vfs->filed[2].fd = console;
-	vfs_add(winfs_alloc());
-	vfs_add(devfs_alloc());
-	vfs_add(procfs_alloc());
-	vfs_add(sysfs_alloc());
 	/* Initialize CWD */
-	if (vfs_openat(AT_FDCWD, "/", O_DIRECTORY | O_PATH, 0, &vfs->cwd) < 0)
+	if (vfs_openat(AT_FDCWD, "/", O_DIRECTORY | O_PATH, 0, 0, &vfs->cwd) < 0)
 	{
 		log_error("Opening initial current directory \"/\" failed.");
 		__debugbreak();
@@ -174,18 +337,6 @@ void vfs_shutdown()
 		if (f)
 			vfs_close(i);
 	}
-	socket_shutdown();
-}
-
-int vfs_fork(HANDLE process)
-{
-	if (!console_fork(process))
-		return 0;
-	AcquireSRWLockShared(&vfs->rw_lock);
-	for (int i = 0; i < MAX_FD_COUNT; i++)
-		if (vfs->filed[i].fd)
-			AcquireSRWLockShared(&vfs->filed[i].fd->rw_lock);
-	return 1;
 }
 
 static int cmpfiled(const void *a, const void *b)
@@ -210,17 +361,42 @@ static int cmpfiled(const void *a, const void *b)
 	}
 }
 
+int vfs_fork(HANDLE process, DWORD process_id)
+{
+	if (!console_fork(process))
+		return 0;
+	AcquireSRWLockShared(&vfs->rw_lock);
+	int index[MAX_FD_COUNT];
+	for (int i = 0; i < MAX_FD_COUNT; i++)
+		index[i] = i;
+	qsort(index, MAX_FD_COUNT, sizeof(int), cmpfiled);
+
+	struct file *last = NULL;
+	for (int i = 0; i < MAX_FD_COUNT; i++)
+	{
+		struct file *f = vfs->filed[index[i]].fd;
+		if (f && f != last)
+		{
+			if (f->op_vtable->fork)
+				f->op_vtable->fork(f, process, process_id);
+			else
+				AcquireSRWLockShared(&f->rw_lock);
+		}
+		last = f;
+	}
+	return 1;
+}
+
 void vfs_afterfork_child()
 {
 	vfs = mm_static_alloc(sizeof(struct vfs_data));
+	vfs_shared = shared_alloc(sizeof(struct vfs_shared_data));
 	InitializeSRWLock(&vfs->rw_lock);
 	console_afterfork();
 
 	int index[MAX_FD_COUNT];
 	for (int i = 0; i < MAX_FD_COUNT; i++)
-	{
 		index[i] = i;
-	}
 
 	qsort(index, MAX_FD_COUNT, sizeof(int), cmpfiled);
 
@@ -231,8 +407,8 @@ void vfs_afterfork_child()
 		if (f && f != last)
 		{
 			InitializeSRWLock(&f->rw_lock);
-			if (f->op_vtable->after_fork)
-				f->op_vtable->after_fork(f);
+			if (f->op_vtable->after_fork_child)
+				f->op_vtable->after_fork_child(f);
 		}
 		last = f;
 	}
@@ -240,9 +416,25 @@ void vfs_afterfork_child()
 
 void vfs_afterfork_parent()
 {
+	int index[MAX_FD_COUNT];
 	for (int i = 0; i < MAX_FD_COUNT; i++)
-		if (vfs->filed[i].fd)
-			ReleaseSRWLockShared(&vfs->filed[i].fd->rw_lock);
+		index[i] = i;
+
+	qsort(index, MAX_FD_COUNT, sizeof(int), cmpfiled);
+
+	struct file *last = NULL;
+	for (int i = 0; i < MAX_FD_COUNT; i++)
+	{
+		struct file *f = vfs->filed[index[i]].fd;
+		if (f && f != last)
+		{
+			if (f->op_vtable->after_fork_parent)
+				f->op_vtable->after_fork_parent(f);
+			else
+				ReleaseSRWLockShared(&f->rw_lock);
+		}
+		last = f;
+	}
 	ReleaseSRWLockShared(&vfs->rw_lock);
 }
 
@@ -631,9 +823,9 @@ DEFINE_SYSCALL(pwritev, int, fd, const struct iovec *, iov, int, iovcnt, off_t, 
 DEFINE_SYSCALL(truncate, const char *, path, off_t, length)
 {
 	log_info("truncate(\"%s\", %p)", path, length);
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	struct file *f;
-	int r = vfs_openat(AT_FDCWD, path, O_WRONLY, 0, &f);
+	int r = vfs_openat(AT_FDCWD, path, O_WRONLY, INTERNAL_O_NOINHERIT, 0, &f);
 	if (r == 0)
 	{
 		if (!f->op_vtable->truncate)
@@ -645,7 +837,7 @@ DEFINE_SYSCALL(truncate, const char *, path, off_t, length)
 			r = f->op_vtable->truncate(f, length);
 		vfs_release(f);
 	}
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -671,9 +863,9 @@ DEFINE_SYSCALL(ftruncate, int, fd, off_t, length)
 DEFINE_SYSCALL(truncate64, const char *, path, loff_t, length)
 {
 	log_info("truncate64(\"%s\", %lld)", path, length);
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	struct file *f;
-	int r = vfs_openat(AT_FDCWD, path, O_WRONLY, 0, &f);
+	int r = vfs_openat(AT_FDCWD, path, O_WRONLY, INTERNAL_O_NOINHERIT, 0, &f);
 	if (r == 0)
 	{
 		if (!f->op_vtable->truncate)
@@ -685,7 +877,7 @@ DEFINE_SYSCALL(truncate64, const char *, path, loff_t, length)
 			r = f->op_vtable->truncate(f, length);
 		vfs_release(f);
 	}
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -796,28 +988,28 @@ DEFINE_SYSCALL(llseek, int, fd, unsigned long, offset_high, unsigned long, offse
 	return r;
 }
 
-static int find_filesystem(const char *path, struct file_system **out_fs, const char **out_subpath)
+static bool find_mountpoint(const char *path, struct mount_point *out_mp, const char **out_subpath)
 {
-	struct file_system *fs;
-	for (fs = vfs->fs_first; fs; fs = fs->next)
+	for (int i = vfs_shared->mp_first; i; i = vfs_shared->mounts[i].next)
 	{
-		const char *p = fs->mountpoint;
+		const struct mount_point *mp = &vfs_shared->mounts[i];
+		const char *p = mp->mountpoint;
 		const char *subpath = path;
 		while (*p && *p == *subpath)
 		{
 			p++;
 			subpath++;
 		}
-		if (*p == 0)
+		if (*p == 0 && (i == vfs_shared->root_id || *subpath == 0 || *subpath == '/'))
 		{
-			*out_fs = fs;
+			copy_mountpoint(mp, out_mp);
 			*out_subpath = subpath;
 			if (**out_subpath == '/')
 				(*out_subpath)++;
-			return 1;
+			return true;
 		}
 	}
-	return 0;
+	return false;
 }
 
 /* Resolve a given path (except the last component), output the real path
@@ -878,14 +1070,15 @@ static int resolve_path(const char *dirpath, const char *pathname, char *realpat
 				/* Resolve component */
 				for (;;)
 				{
-					struct file_system *fs;
+					struct mount_point mp;
 					char *subpath;
 					*realpath = 0;
-					if (!find_filesystem(realpath_start, &fs, &subpath))
+					if (!find_mountpoint(realpath_start, &mp, &subpath))
 						return -L_ENOTDIR;
+					struct file_system *fs = mp.fs;
 					if (!fs->open)
 						return -L_ENOTDIR;
-					int r = fs->open(fs, subpath, O_PATH | O_DIRECTORY, 0, NULL, target, PATH_MAX);
+					int r = fs->open(&mp, subpath, O_PATH | O_DIRECTORY, 0, 0, NULL, target, PATH_MAX);
 					if (r < 0)
 						return r;
 					else if (r == 0) /* It is a regular file, go forward */
@@ -953,7 +1146,7 @@ int resolve_pathat(int dirfd, const char *pathname, char *realpath, int *symlink
 	return resolve_path(dirpath, pathname, realpath, symlink_remain);
 }
 
-int vfs_openat(int dirfd, const char *pathname, int flags, int mode, struct file **f)
+int vfs_openat(int dirfd, const char *pathname, int flags, int internal_flags, int mode, struct file **f)
 {
 	/*
 	Supported flags:
@@ -998,11 +1191,12 @@ int vfs_openat(int dirfd, const char *pathname, int flags, int mode, struct file
 	{
 		if (r < 0)
 			return r;
-		struct file_system *fs;
+		struct mount_point mp;
 		char *subpath;
-		if (!find_filesystem(realpath, &fs, &subpath))
+		if (!find_mountpoint(realpath, &mp, &subpath))
 			return -L_ENOENT;
-		int ret = fs->open(fs, subpath, flags, mode, f, target, PATH_MAX);
+		struct file_system *fs = mp.fs;
+		int ret = fs->open(&mp, subpath, flags, internal_flags, mode, f, target, PATH_MAX);
 		if (ret <= 0)
 			return ret;
 		else if (ret == 1)
@@ -1029,7 +1223,7 @@ DEFINE_SYSCALL(openat, int, dirfd, const char *, pathname, int, flags, int, mode
 		return -L_EFAULT;
 	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
-	int r = vfs_openat(dirfd, pathname, flags, mode, &f);
+	int r = vfs_openat(dirfd, pathname, flags, 0, mode, &f);
 	if (r >= 0)
 	{
 		r = store_file_internal(f, (flags & O_CLOEXEC) > 0);
@@ -1092,12 +1286,12 @@ DEFINE_SYSCALL(linkat, int, olddirfd, const char *, oldpath, int, newdirfd, cons
 		log_error("AT_EMPTY_PATH not supported.");
 		return -L_EINVAL;
 	}
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	struct file *f;
 	int openflags = O_PATH;
 	if (!(openflags & AT_SYMLINK_FOLLOW))
 		openflags |= O_NOFOLLOW;
-	int r = vfs_openat(olddirfd, oldpath, openflags, 0, &f);
+	int r = vfs_openat(olddirfd, oldpath, openflags, INTERNAL_O_NOINHERIT, 0, &f);
 	if (r < 0)
 		goto out;
 	if (!winfs_is_winfile(f))
@@ -1110,17 +1304,21 @@ DEFINE_SYSCALL(linkat, int, olddirfd, const char *, oldpath, int, newdirfd, cons
 	r = resolve_pathat(newdirfd, newpath, realpath, &symlink_remain);
 	if (r < 0)
 		goto out;
-	struct file_system *fs;
+	struct mount_point mp;
 	char *subpath;
-	if (!find_filesystem(realpath, &fs, &subpath))
+	if (!find_mountpoint(realpath, &mp, &subpath))
 		r = -L_ENOENT;
-	else if (!fs->link)
-		r = -L_EXDEV;
 	else
-		r = fs->link(fs, f, subpath);
+	{
+		struct file_system *fs = mp.fs;
+		if (!fs->link)
+			r = -L_EXDEV;
+		else
+			r = fs->link(&mp, f, subpath);
+	}
 	vfs_release(f);
 out:
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -1136,32 +1334,36 @@ DEFINE_SYSCALL(unlinkat, int, dirfd, const char *, pathname, int, flags)
 	if (!mm_check_read_string(pathname))
 		return -L_EFAULT;
 
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	char realpath[PATH_MAX];
 	int symlink_remain = MAX_SYMLINK_LEVEL;
 	int r = resolve_pathat(dirfd, pathname, realpath, &symlink_remain);
 	if (r >= 0)
 	{
-		struct file_system *fs;
+		struct mount_point mp;
 		char *subpath;
-		if (!find_filesystem(realpath, &fs, &subpath))
+		if (!find_mountpoint(realpath, &mp, &subpath))
 			r = -L_ENOENT;
-		else if (flags & AT_REMOVEDIR)
-		{
-			if (!fs->rmdir)
-				r = -L_EPERM;
-			else
-				r = fs->rmdir(fs, subpath);
-		}
 		else
 		{
-			if (!fs->unlink)
-				r = -L_EPERM;
+			struct file_system *fs = mp.fs;
+			if (flags & AT_REMOVEDIR)
+			{
+				if (!fs->rmdir)
+					r = -L_EPERM;
+				else
+					r = fs->rmdir(&mp, subpath);
+			}
 			else
-				r = fs->unlink(fs, subpath);
+			{
+				if (!fs->unlink)
+					r = -L_EPERM;
+				else
+					r = fs->unlink(&mp, subpath);
+			}
 		}
 	}
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -1176,22 +1378,26 @@ DEFINE_SYSCALL(symlinkat, const char *, target, int, newdirfd, const char *, lin
 	log_info("symlinkat(\"%s\", %d, \"%s\")", target, newdirfd, linkpath);
 	if (!mm_check_read_string(target) || !mm_check_read_string(linkpath))
 		return -L_EFAULT;
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	char realpath[PATH_MAX];
 	int symlink_remain = MAX_SYMLINK_LEVEL;
 	int r = resolve_pathat(newdirfd, linkpath, realpath, &symlink_remain);
 	if (r >= 0)
 	{
-		struct file_system *fs;
+		struct mount_point mp;
 		char *subpath;
-		if (!find_filesystem(realpath, &fs, &subpath))
+		if (!find_mountpoint(realpath, &mp, &subpath))
 			r = -L_ENOTDIR;
-		else if (!fs->symlink)
-			r = -L_EPERM;
 		else
-			r = fs->symlink(fs, target, subpath);
+		{
+			struct file_system *fs = mp.fs;
+			if (!fs->symlink)
+				r = -L_EPERM;
+			else
+				r = fs->symlink(&mp, target, subpath);
+		}
 	}
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -1206,9 +1412,9 @@ DEFINE_SYSCALL(readlinkat, int, dirfd, const char *, pathname, char *, buf, int,
 	log_info("readlinkat(%d, \"%s\", %p, %d)", dirfd, pathname, buf, bufsize);
 	if (!mm_check_read_string(pathname) || !mm_check_write(buf, bufsize))
 		return -L_EFAULT;
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	struct file *f;
-	int r = vfs_openat(dirfd, pathname, O_PATH | O_NOFOLLOW, 0, &f);
+	int r = vfs_openat(dirfd, pathname, O_PATH | O_NOFOLLOW, INTERNAL_O_NOINHERIT, 0, &f);
 	if (r >= 0)
 	{
 		if (!f->op_vtable->readlink)
@@ -1220,7 +1426,7 @@ DEFINE_SYSCALL(readlinkat, int, dirfd, const char *, pathname, char *, buf, int,
 			r = f->op_vtable->readlink(f, buf, bufsize);
 		vfs_release(f);
 	}
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -1240,9 +1446,9 @@ DEFINE_SYSCALL(renameat2, int, olddirfd, const char *, oldpath, int, newdirfd, c
 	}
 	if (!mm_check_read_string(oldpath) || !mm_check_read_string(newpath))
 		return -L_EFAULT;
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	struct file *f;
-	int r = vfs_openat(olddirfd, oldpath, O_PATH | O_NOFOLLOW | __O_DELETE, 0, &f);
+	int r = vfs_openat(olddirfd, oldpath, O_PATH | O_NOFOLLOW, INTERNAL_O_DELETE | INTERNAL_O_NOINHERIT, 0, &f);
 	if (r < 0)
 		goto out;
 	if (!winfs_is_winfile(f))
@@ -1255,17 +1461,21 @@ DEFINE_SYSCALL(renameat2, int, olddirfd, const char *, oldpath, int, newdirfd, c
 	r = resolve_pathat(newdirfd, newpath, realpath, &symlink_remain);
 	if (r < 0)
 		goto out;
-	struct file_system *fs;
+	struct mount_point mp;
 	char *subpath;
-	if (!find_filesystem(realpath, &fs, &subpath))
-		r = -L_EXDEV;
-	else if (!fs->rename)
+	if (!find_mountpoint(realpath, &mp, &subpath))
 		r = -L_EXDEV;
 	else
-		r = fs->rename(fs, f, subpath);
+	{
+		struct file_system *fs = mp.fs;
+		if (!fs->rename)
+			r = -L_EXDEV;
+		else
+			r = fs->rename(&mp, f, subpath);
+	}
 	vfs_release(f);
 out:
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -1288,7 +1498,7 @@ DEFINE_SYSCALL(mkdirat, int, dirfd, const char *, pathname, int, mode)
 		log_error("mode != 0");
 	if (!mm_check_read_string(pathname))
 		return -L_EFAULT;
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	char realpath[PATH_MAX];
 	int symlink_remain = MAX_SYMLINK_LEVEL;
 	/* Very special case: mkdir with a tailing slash is equivalent to no tailing slash */
@@ -1305,16 +1515,20 @@ DEFINE_SYSCALL(mkdirat, int, dirfd, const char *, pathname, int, mode)
 		r = resolve_pathat(dirfd, pathname, realpath, &symlink_remain);
 	if (r >= 0)
 	{
-		struct file_system *fs;
+		struct mount_point mp;
 		char *subpath;
-		if (!find_filesystem(realpath, &fs, &subpath))
+		if (!find_mountpoint(realpath, &mp, &subpath))
 			r = -L_ENOTDIR;
-		else if (!fs->mkdir)
-			r = -L_EPERM;
 		else
-			r = fs->mkdir(fs, subpath, mode);
+		{
+			struct file_system *fs = mp.fs;
+			if (!fs->mkdir)
+				r = -L_EPERM;
+			else
+				r = fs->mkdir(&mp, subpath, mode);
+		}
 	}
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -1482,7 +1696,7 @@ static int stat64_from_newstat(struct stat64 *stat, const struct newstat *newsta
 static int vfs_statat(int dirfd, const char *pathname, struct newstat *stat, int flags)
 {
 	int r = 0;
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	if (flags & AT_NO_AUTOMOUNT)
 	{
 		log_error("AT_NO_AUTOMOUNT not supported.");
@@ -1504,7 +1718,7 @@ static int vfs_statat(int dirfd, const char *pathname, struct newstat *stat, int
 		int openflags = O_PATH;
 		if (flags & AT_SYMLINK_NOFOLLOW)
 			openflags |= O_NOFOLLOW;
-		r = vfs_openat(dirfd, pathname, openflags, 0, &f);
+		r = vfs_openat(dirfd, pathname, openflags, INTERNAL_O_NOINHERIT, 0, &f);
 		if (r < 0)
 			goto out;
 	}
@@ -1518,7 +1732,7 @@ static int vfs_statat(int dirfd, const char *pathname, struct newstat *stat, int
 	vfs_release(f);
 
 out:
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -1688,9 +1902,9 @@ static int vfs_fstatfs(int fd, struct statfs64 *buf)
 
 static int vfs_statfs(const char *pathname, struct statfs64 *buf)
 {
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	struct file *f;
-	int r = vfs_openat(AT_FDCWD, pathname, O_PATH, 0, &f);
+	int r = vfs_openat(AT_FDCWD, pathname, O_PATH, INTERNAL_O_NOINHERIT, 0, &f);
 	if (r == 0)
 	{
 		if (!f->op_vtable->statfs)
@@ -1702,7 +1916,7 @@ static int vfs_statfs(const char *pathname, struct statfs64 *buf)
 			r = f->op_vtable->statfs(f, buf);
 		vfs_release(f);
 	}
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -1832,9 +2046,9 @@ DEFINE_SYSCALL(utime, const char *, filename, const struct utimbuf *, times)
 	log_info("utime(\"%s\", %p)", filename, times);
 	if (!mm_check_read_string(filename) || (times && !mm_check_read(times, sizeof(struct utimbuf))))
 		return -L_EFAULT;
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	struct file *f;
-	int r = vfs_openat(AT_FDCWD, filename, O_WRONLY, 0, &f);
+	int r = vfs_openat(AT_FDCWD, filename, O_WRONLY, INTERNAL_O_NOINHERIT, 0, &f);
 	if (r < 0)
 		goto out;
 	if (!f->op_vtable->utimens)
@@ -1859,7 +2073,7 @@ DEFINE_SYSCALL(utime, const char *, filename, const struct utimbuf *, times)
 	vfs_release(f);
 
 out:
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -1868,9 +2082,9 @@ DEFINE_SYSCALL(utimes, const char *, filename, const struct timeval *, times)
 	log_info("utimes(\"%s\", %p)", filename, times);
 	if (!mm_check_read_string(filename) || (times && !mm_check_read(times, 2 * sizeof(struct timeval))))
 		return -L_EFAULT;
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	struct file *f;
-	int r = vfs_openat(AT_FDCWD, filename, O_WRONLY, 0, &f);
+	int r = vfs_openat(AT_FDCWD, filename, O_WRONLY, INTERNAL_O_NOINHERIT, 0, &f);
 	if (r < 0)
 		goto out;
 	if (!f->op_vtable->utimens)
@@ -1892,7 +2106,7 @@ DEFINE_SYSCALL(utimes, const char *, filename, const struct timeval *, times)
 	}
 	vfs_release(f);
 out:
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -1919,12 +2133,12 @@ DEFINE_SYSCALL(utimensat, int, dirfd, const char *, pathname, const struct times
 			vfs_release(f);
 		return r;
 	}
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	int openflags = O_WRONLY | O_PATH;
 	if (flags & AT_SYMLINK_NOFOLLOW)
 		openflags |= O_NOFOLLOW;
 	struct file *f;
-	int r = vfs_openat(dirfd, pathname, openflags, 0, &f);
+	int r = vfs_openat(dirfd, pathname, openflags, INTERNAL_O_NOINHERIT, 0, &f);
 	if (r < 0)
 		goto out;
 	if (!f->op_vtable->utimens)
@@ -1936,7 +2150,7 @@ DEFINE_SYSCALL(utimensat, int, dirfd, const char *, pathname, const struct times
 		r = f->op_vtable->utimens(f, times);
 	vfs_release(f);
 out:
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -1947,7 +2161,7 @@ DEFINE_SYSCALL(chdir, const char *, pathname)
 		return -L_EFAULT;
 	AcquireSRWLockExclusive(&vfs->rw_lock);
 	struct file *f;
-	int r = vfs_openat(AT_FDCWD, pathname, O_PATH | O_DIRECTORY, 0, &f);
+	int r = vfs_openat(AT_FDCWD, pathname, O_PATH | O_DIRECTORY, 0, 0, &f);
 	if (r < 0)
 		goto out;
 	vfs_release(vfs->cwd);
@@ -2058,18 +2272,18 @@ DEFINE_SYSCALL(faccessat, int, dirfd, const char *, pathname, int, mode, int, fl
 	log_info("faccessat(%d, \"%s\", %d, %x)", dirfd, pathname, mode, flags);
 	if (!mm_check_read_string(pathname))
 		return -L_EFAULT;
-	AcquireSRWLockExclusive(&vfs->rw_lock);
+	AcquireSRWLockShared(&vfs->rw_lock);
 	int openflags = O_PATH;
 	if (flags & AT_SYMLINK_NOFOLLOW)
 		openflags |= O_NOFOLLOW;
 	/* Currently emulate access behaviour by testing whether the file exists */
 	struct file *f;
-	int r = vfs_openat(dirfd, pathname, openflags, mode, &f);
+	int r = vfs_openat(dirfd, pathname, openflags, INTERNAL_O_NOINHERIT, mode, &f);
 	if (r < 0)
 		goto out;
 	vfs_release(f);
 out:
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
+	ReleaseSRWLockShared(&vfs->rw_lock);
 	return r;
 }
 
@@ -2115,21 +2329,8 @@ DEFINE_SYSCALL(chroot, const char *, pathname)
 	log_info("chroot(\"%s\")", pathname);
 	if (!mm_check_read_string(pathname))
 		return -L_EFAULT;
-	AcquireSRWLockExclusive(&vfs->rw_lock);
-	char realpath[PATH_MAX];
-	int symlink_remain = MAX_SYMLINK_LEVEL;
-	int r = resolve_pathat(AT_FDCWD, pathname, realpath, &symlink_remain);
-	if (r < 0)
-		goto out;
-	log_info("resolved path: \"%s\"", realpath);
-	WCHAR wpath[PATH_MAX];
-	utf8_to_utf16_filename(realpath, r + 1, wpath, PATH_MAX);
-	/* TODO */
-	if (!SetCurrentDirectoryW(wpath + 1)) /* ignore the heading slash */
-		log_error("SetCurrentDirectoryW() failed, error code: %d", GetLastError());
-out:
-	ReleaseSRWLockExclusive(&vfs->rw_lock);
-	return r;
+	log_error("chroot() not implemented.");
+	return -L_ENOSYS;
 }
 
 DEFINE_SYSCALL(fchownat, int, dirfd, const char *, pathname, uid_t, owner, gid_t, group, int, flags)
@@ -2183,6 +2384,7 @@ static int vfs_ppoll(struct linux_pollfd *fds, int nfds, int timeout, const sigs
 			files[i] = NULL;
 			continue;
 		}
+		log_info("FD: %d EVENTS: %x", fds[i].fd, fds[i].events);
 		struct file *f = files[i] = vfs_get(fds[i].fd);
 		/* TODO: Support for regular files */
 		if (!f)

@@ -24,6 +24,7 @@
 #include <syscall/mm.h>
 #include <syscall/sig.h>
 #include <syscall/tls.h>
+#include <flags.h>
 #include <log.h>
 
 #include <stdbool.h>
@@ -31,6 +32,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 #include <ntdll.h>
+#include <immintrin.h>
 
 #define GET_MODRM_MOD(c)	(((c) >> 6) & 7)
 #define GET_MODRM_R(c)		(((c) >> 3) & 7)
@@ -373,8 +375,13 @@ static __forceinline void gen_popfd(uint8_t **out)
 
 static __forceinline void gen_pop_rm(uint8_t **out, struct modrm_rm_t rm)
 {
-	gen_byte(out, 0x8F);
-	gen_modrm_sib(out, 0, rm);
+	if (modrm_rm_is_r(rm))
+		gen_byte(out, 0x58 + rm.base);
+	else
+	{
+		gen_byte(out, 0x8F);
+		gen_modrm_sib(out, 0, rm);
+	}
 }
 
 static __forceinline void gen_pushfd(uint8_t **out)
@@ -384,8 +391,13 @@ static __forceinline void gen_pushfd(uint8_t **out)
 
 static __forceinline void gen_push_rm(uint8_t **out, struct modrm_rm_t rm)
 {
-	gen_byte(out, 0xFF);
-	gen_modrm_sib(out, 6, rm);
+	if (modrm_rm_is_r(rm))
+		gen_byte(out, 0x50 + rm.base);
+	else
+	{
+		gen_byte(out, 0xFF);
+		gen_modrm_sib(out, 6, rm);
+	}
 }
 
 static __forceinline void gen_push_imm32(uint8_t **out, uint32_t imm)
@@ -510,6 +522,7 @@ struct dbt_data
 	uint8_t *sieve_indirect_call_dispatch_trampoline;
 	/* Return cache */
 	uint8_t **return_cache;
+	uint8_t *return_fallback_trampoline;
 	/* Information of current signal to be delivered */
 	bool signal_pending;
 	bool signal_need_fixup;
@@ -519,13 +532,27 @@ extern void dbt_find_direct_internal();
 extern void dbt_find_indirect_internal();
 extern void dbt_sieve_fallback();
 
-extern void dbt_save_simd_state();
-extern void dbt_restore_simd_state();
-
 extern void dbt_cpuid_internal();
 extern void syscall_handler();
 
+static __declspec(thread, align(16)) char dbt_simd_state[512];
+
+static void dbt_save_simd_state()
+{
+	_fxsave(dbt_simd_state);
+}
+
+static void dbt_restore_simd_state()
+{
+	_fxrstor(dbt_simd_state);
+}
+
 static __declspec(thread) struct dbt_data *dbt;
+/* A helper flag which will be set to true in dbt_flush().
+ * User can first set this to true, and read it after some operations
+ * to determine if dbt code cache is flushed during the operations.
+ */
+static __declspec(thread) bool dbt_flushed;
 
 /* We use a return trampoline for returning to user code from kernel code
  * The return address is stored in TLS and set up in kernel code
@@ -730,7 +757,7 @@ static void dbt_gen_tables()
 	dbt->internal_trampoline_end = dbt->out;
 	dbt_gen_sieve_dispatch();
 	for (int i = 0; i < DBT_RETURN_CACHE_ENTRIES; i++)
-		dbt->return_cache[i] = (uint8_t*)&dbt_sieve_fallback;
+		dbt->return_cache[i] = dbt->return_fallback_trampoline;
 }
 
 void dbt_init_thread()
@@ -773,6 +800,7 @@ static void dbt_flush()
 	for (int i = 0; i < DBT_BLOCK_HASH_BUCKETS; i++)
 		slist_init(&dbt->block_hash[i]);
 	dbt_gen_tables();
+	dbt_flushed = true;
 	log_info("dbt code cache flushed.");
 }
 
@@ -831,6 +859,8 @@ static void dbt_gen_sieve_dispatch()
 	/* The destination address should be pushed on the stack */
 	/* push ecx (1 byte) */
 	gen_byte(&out, 0x51);
+	dbt->return_fallback_trampoline = out;
+
 	/* movzx ecx, word ptr [esp+4] (5 bytes) */
 	gen_byte(&out, 0x0F); gen_byte(&out, 0xB7); gen_byte(&out, 0x4C);
 	gen_byte(&out, 0x24); gen_byte(&out, 0x04);
@@ -1037,12 +1067,13 @@ static bool dbt_direct_call_trampoline_fixup(struct syscall_context *context)
 struct instruction_t
 {
 	uint8_t opcode;
-	uint8_t opsize_prefix, rep_prefix;
-	int segment_prefix;
-	int lock_prefix;
-	int escape_0x0f;
+	uint8_t rep_prefix, segment_prefix;
+	bool opsize_prefix;
+	bool lock_prefix;
+	bool escape_0x0f;
 	uint8_t escape_byte2; /* 0x38 or 0x3A */
 	int r;
+	bool has_modrm;
 	struct modrm_rm_t rm;
 	int imm_bytes;
 	const struct instruction_desc *desc;
@@ -1052,15 +1083,26 @@ struct instruction_t
 static int find_unused_register(struct instruction_t *ins)
 {
 	/* Calculate used registers in this instruction */
-	int used_regs = ins->desc->read_regs | ins->desc->write_regs;
+	int used_regs = 0;
+	used_regs |= get_implicit_register_usage(ins->desc->op1, ins->opcode);
+	used_regs |= get_implicit_register_usage(ins->desc->op2, ins->opcode);
+	used_regs |= get_implicit_register_usage(ins->desc->op3, ins->opcode);
+	if ((ins->desc->handler_type & HANDLER_NORMAL) == HANDLER_NORMAL)
+	{
+		/* Additional register usage */
+		used_regs |= ins->desc->handler_type;
+	}
+	if (ins->has_modrm)
+	{
+		if (ins->r != -1)
+			used_regs |= REG_MASK(ins->r);
+		if (ins->rm.base != -1)
+			used_regs |= REG_MASK(ins->rm.base);
+		if (ins->rm.index != -1)
+			used_regs |= REG_MASK(ins->rm.index);
+	}
 	if (ins->rep_prefix)
 		used_regs |= REG_CX;
-	if (ins->r != -1)
-		used_regs |= REG_MASK(ins->r);
-	if (ins->rm.base != -1)
-		used_regs |= REG_MASK(ins->rm.base);
-	if (ins->rm.index != -1)
-		used_regs |= REG_MASK(ins->rm.index);
 #define TEST_REG(r) do { if ((used_regs & REG_MASK(r)) == 0) return r; } while (0)
 	/* We really don't want to use esp or ebp as a temporary register */
 	TEST_REG(EAX);
@@ -1098,7 +1140,7 @@ static void dbt_copy_instruction(uint8_t **out, uint8_t **code, struct instructi
 	if (ins->lock_prefix)
 		gen_byte(out, 0xF0);
 	if (ins->opsize_prefix)
-		gen_byte(out, ins->opsize_prefix);
+		gen_byte(out, 0x66);
 	if (ins->rep_prefix)
 		gen_byte(out, ins->rep_prefix);
 	if (ins->segment_prefix && ins->segment_prefix != PREFIX_GS)
@@ -1110,7 +1152,7 @@ static void dbt_copy_instruction(uint8_t **out, uint8_t **code, struct instructi
 			gen_byte(out, ins->escape_byte2);
 	}
 	gen_byte(out, ins->opcode);
-	if (ins->desc->has_modrm)
+	if (ins->has_modrm)
 		gen_modrm_sib(out, ins->r, ins->rm);
 	gen_copy(out, imm_start, ins->imm_bytes);
 }
@@ -1273,7 +1315,12 @@ static struct dbt_block *dbt_translate(size_t pc, struct syscall_context *contex
 		block = alloc_block();
 		if (!block) /* The cache is full */
 		{
-			/* TODO: We may need to check this flush-all-on-full semantic when we add signal handling */
+			if (cmdline_flags->dbt_trace)
+			{
+				dbt_save_simd_state();
+				log_debug("dbt cache is full, flushing code cache... (current pc = %p)", pc);
+				dbt_restore_simd_state();
+			}
 			dbt_flush();
 			block = alloc_block(); /* We won't fail again */
 		}
@@ -1282,10 +1329,13 @@ static struct dbt_block *dbt_translate(size_t pc, struct syscall_context *contex
 		rb_add(&dbt->tree, &block->tree, tree_cmp);
 		rb_add(&dbt->cache_tree, &block->cache_tree, cache_tree_cmp);
 	}
-
-	//dbt_save_simd_state();
-	//log_debug("block id: %d, pc: %p, block start: %p", dbt->blocks_count, block->pc, block->start);
-	//dbt_restore_simd_state();
+	
+	if (cmdline_flags->dbt_trace)
+	{
+		dbt_save_simd_state();
+		log_debug("dbt_translate: id: %d, pc: %p, translated pc: %p, end: %p", dbt->blocks_count, block->pc, block->start, dbt->end);
+		dbt_restore_simd_state();
+	}
 
 	uint8_t *code = (uint8_t *)pc;
 	uint8_t *out = block->start;
@@ -1298,11 +1348,18 @@ static struct dbt_block *dbt_translate(size_t pc, struct syscall_context *contex
 			context->eip = current_ip;
 			goto end_block;
 		}
+		if (dbt->end - out < DBT_BLOCK_MAXSIZE)
+		{
+			/* No enough space for code generation, emit a temporary trampoline and give up */
+			size_t patch_addr = (size_t)out + 1;
+			gen_jmp(&out, dbt_get_direct_trampoline((size_t)code, patch_addr));
+			goto end_block;
+		}
 		struct instruction_t ins;
 		ins.rep_prefix = 0;
-		ins.opsize_prefix = 0;
 		ins.segment_prefix = 0;
-		ins.lock_prefix = 0;
+		ins.opsize_prefix = false;
+		ins.lock_prefix = false;
 		/* Handle prefixes. According to x86 doc, they can appear in any order */
 		for (;;)
 		{
@@ -1312,7 +1369,7 @@ static struct dbt_block *dbt_translate(size_t pc, struct syscall_context *contex
 			switch (ins.opcode)
 			{
 			case 0xF0: /* LOCK */
-				ins.lock_prefix = 1;
+				ins.lock_prefix = true;
 				break;
 
 			case 0xF2: /* REPNE/REPNZ */
@@ -1349,7 +1406,7 @@ static struct dbt_block *dbt_translate(size_t pc, struct syscall_context *contex
 				break;
 
 			case 0x66: /* Operand size prefix */
-				ins.opsize_prefix = 0x66;
+				ins.opsize_prefix = true;
 				break;
 
 			case 0x67: /* Address size prefix */
@@ -1365,12 +1422,12 @@ static struct dbt_block *dbt_translate(size_t pc, struct syscall_context *contex
 done_prefix:
 
 		/* Extract instruction descriptor */
-		ins.escape_0x0f = 0;
+		ins.escape_0x0f = false;
 		ins.escape_byte2 = 0;
 
 		if (ins.opcode == 0x0F)
 		{
-			ins.escape_0x0f = 1;
+			ins.escape_0x0f = true;
 			ins.opcode = parse_byte(&code);
 			if (ins.opcode == 0x38)
 			{
@@ -1390,55 +1447,85 @@ done_prefix:
 		else
 			ins.desc = &one_byte_inst[ins.opcode];
 
-	inst_mandatory_reentry:
-		if (ins.desc->has_modrm)
-			parse_modrm(&code, &ins.r, &ins.rm);
-		
-	inst_extension_reentry:
-		ins.imm_bytes = ins.desc->imm_bytes;
-		if (ins.imm_bytes == PREFIX_OPERAND_SIZE)
-			ins.imm_bytes = ins.opsize_prefix? 2: 4;
-		else if (ins.imm_bytes == PREFIX_ADDRESS_SIZE)
-			ins.imm_bytes = 4;
-
-		if (ins.desc->require_0x66 && !ins.opsize_prefix)
+		/* Follow extension tables */
+		ins.has_modrm = false;
+		while (ins.desc->type <= INST_TYPE_MAX)
 		{
-			log_error("Unknown opcode.");
-			__debugbreak();
+			switch (ins.desc->type)
+			{
+			case INST_TYPE_UNKNOWN: log_error("Unknown opcode."); dbt_log_opcode(&ins); __debugbreak(); break;
+			case INST_TYPE_INVALID: log_error("Invalid opcode."); dbt_log_opcode(&ins); __debugbreak(); break;
+			case INST_TYPE_UNSUPPORTED: log_error("Unsupported opcode."); dbt_log_opcode(&ins); __debugbreak(); break;
+
+			case INST_TYPE_MANDATORY:
+			{
+				if (!ins.escape_0x0f)
+				{
+					log_error("Invalid opcode.");
+					__debugbreak();
+				}
+				if (ins.opsize_prefix)
+					ins.desc = &ins.desc->extension_table[MANDATORY_0x66];
+				else if (ins.rep_prefix == 0xF3)
+					ins.desc = &ins.desc->extension_table[MANDATORY_0xF3];
+				else if (ins.rep_prefix == 0xF2)
+					ins.desc = &ins.desc->extension_table[MANDATORY_0xF2];
+				else
+					ins.desc = &ins.desc->extension_table[MANDATORY_NONE];
+				break;
+			}
+
+			case INST_TYPE_EXTENSION:
+			{
+				if (!ins.has_modrm)
+				{
+					parse_modrm(&code, &ins.r, &ins.rm);
+					ins.has_modrm = true;
+				}
+				ins.desc = &ins.desc->extension_table[ins.r];
+				break;
+			}
+
+			case INST_TYPE_MODRM_MOD:
+			{
+				if (!ins.has_modrm)
+				{
+					parse_modrm(&code, &ins.r, &ins.rm);
+					ins.has_modrm = true;
+				}
+				if (modrm_rm_is_r(ins.rm))
+					ins.desc = &ins.desc->extension_table[MODRM_MOD_R];
+				else
+					ins.desc = &ins.desc->extension_table[MODRM_MOD_M];
+				break;
+			}
+			}
 		}
+
+		/* ins.desc now points to the correct instruction description */
+		if (!ins.has_modrm)
+		{
+			/* Do we need modrm? */
+			if (FROM_MODRM(ins.desc->op1) || FROM_MODRM(ins.desc->op2) || FROM_MODRM(ins.desc->op3))
+			{
+				parse_modrm(&code, &ins.r, &ins.rm);
+				ins.has_modrm = true;
+			}
+		}
+
+		/* Calculate number of immediate bytes */
+		ins.imm_bytes = get_imm_bytes(ins.desc->op1, ins.opsize_prefix, false)
+			+ get_imm_bytes(ins.desc->op2, ins.opsize_prefix, false)
+			+ get_imm_bytes(ins.desc->op3, ins.opsize_prefix, false);
+
+		uint8_t handler_type = ins.desc->handler_type;
+		if ((handler_type & HANDLER_NORMAL) == HANDLER_NORMAL)
+			handler_type = HANDLER_NORMAL;
 
 		/* Translate instruction */
-		switch (ins.desc->type)
+		switch (handler_type)
 		{
-		case INST_TYPE_UNKNOWN: log_error("Unknown opcode."); dbt_log_opcode(&ins); __debugbreak(); break;
-		case INST_TYPE_INVALID: log_error("Invalid opcode."); dbt_log_opcode(&ins); __debugbreak(); break;
-		case INST_TYPE_UNSUPPORTED: log_error("Unsupported opcode."); dbt_log_opcode(&ins); __debugbreak(); break;
-
-		case INST_TYPE_EXTENSION:
-		{
-			ins.desc = &ins.desc->extension_table[ins.r];
-			goto inst_extension_reentry;
-		}
-
-		case INST_TYPE_MANDATORY:
-		{
-			if (!ins.escape_0x0f)
-			{
-				log_error("Invalid opcode.");
-				__debugbreak();
-			}
-			if (ins.opsize_prefix)
-				ins.desc = &ins.desc->extension_table[MANDATORY_0x66];
-			else if (ins.rep_prefix == 0xF3)
-				ins.desc = &ins.desc->extension_table[MANDATORY_0xF3];
-			else if (ins.rep_prefix == 0xF2)
-				ins.desc = &ins.desc->extension_table[MANDATORY_0xF2];
-			else
-				ins.desc = &ins.desc->extension_table[MANDATORY_NONE];
-			goto inst_mandatory_reentry;
-		}
-
-		case INST_TYPE_X87:
+		case HANDLER_X87:
 		{
 			/* A very simplistic way to handle x87 escape opcode */
 			uint8_t modrm = *code; /* Peek potential ModR/M byte */
@@ -1451,14 +1538,13 @@ done_prefix:
 				break;
 			}
 			/* An escape opcode with ModR/M, properly parse ModR/M */
-			ins.desc = &x87_desc;
+			ins.has_modrm = true;
 			parse_modrm(&code, &ins.r, &ins.rm);
 			/* Fall through */
 		}
-
-		case INST_TYPE_NORMAL:
+		case HANDLER_NORMAL:
 		{
-			if (ins.segment_prefix == PREFIX_GS && ins.desc->has_modrm && modrm_rm_is_m(ins.rm)
+			if (ins.segment_prefix == PREFIX_GS && ins.has_modrm && modrm_rm_is_m(ins.rm)
 				&& !(!ins.escape_0x0f && ins.opcode == 0x8D)) /* LEA */
 			{
 				/* Instruction with effective gs segment override */
@@ -1501,18 +1587,19 @@ done_prefix:
 			}
 			else /* If nothing special, directly copy instruction */
 				dbt_copy_instruction(&out, &code, &ins);
-
-			if (ins.desc->is_privileged)
-			{
-				/* We have to support translate privileged opcodes because e.g. glibc uses HLT as
-				 * a backup program terminator. */
-				/* The instructions following it won't be executed and could be crap so we stop here */
-				goto end_block;
-			}
 			break;
 		}
 
-		case INST_MOV_MOFFSET:
+		case HANDLER_PRIVILEGED:
+		{
+			/* We have to support translate privileged opcodes because e.g. glibc uses HLT as
+			 * a backup program terminator. */
+			dbt_copy_instruction(&out, &code, &ins);
+			/* The instructions following it won't be executed and could be crap so we stop here */
+			goto end_block;
+		}
+
+		case HANDLER_MOV_MOFFSET:
 		{
 			if (ins.segment_prefix == PREFIX_GS)
 			{
@@ -1565,13 +1652,16 @@ done_prefix:
 			break;
 		}
 
-		case INST_CALL_DIRECT:
+		case HANDLER_CALL_DIRECT:
 		{
 			int32_t rel = parse_rel(&code, ins.imm_bytes);
 			size_t dest = (size_t)code + rel;
 			gen_push_imm32(&out, (size_t)code);
 			gen_mov_rm_imm32(&out, modrm_rm_disp((int32_t)&dbt->return_cache[RETURN_CACHE_HASH((size_t)code)]), 0);
-			*(size_t*)(out - 4) = (size_t)out + 5;
+			if (cmdline_flags->dbt_trace_all) /* Do not do any optimizations */
+				*(size_t*)(out - 4) = (size_t)dbt->return_fallback_trampoline;
+			else
+				*(size_t*)(out - 4) = (size_t)out + 5;
 			if (context && context->eip <= (DWORD)out)
 			{
 				context->esp += 4;
@@ -1587,7 +1677,7 @@ done_prefix:
 			break;
 		}
 
-		case INST_CALL_INDIRECT:
+		case HANDLER_CALL_INDIRECT:
 		{
 			/* TODO: Bad codegen for `call esp', although should never be used in practice */
 			gen_push_imm32(&out, (size_t)code);
@@ -1600,7 +1690,7 @@ done_prefix:
 			if (ins.rm.base == ESP) /* ESP-related address */
 				ins.rm.disp += ESP;
 
-			if (ins.segment_prefix == PREFIX_GS && ins.desc->has_modrm && modrm_rm_is_m(ins.rm))
+			if (ins.segment_prefix == PREFIX_GS && ins.has_modrm && modrm_rm_is_m(ins.rm))
 			{
 				/* call with effective gs segment override */
 				int temp_reg = find_unused_register(&ins);
@@ -1617,7 +1707,10 @@ done_prefix:
 				gen_push_rm(&out, ins.rm);
 			}
 			gen_mov_rm_imm32(&out, modrm_rm_disp((int32_t)&dbt->return_cache[RETURN_CACHE_HASH((size_t)code)]), 0);
-			*(size_t*)(out - 4) = (size_t)out + 5;
+			if (cmdline_flags->dbt_trace_all) /* Do not do any optimizations */
+				*(size_t*)(out - 4) = (size_t)dbt->return_fallback_trampoline;
+			else
+				*(size_t*)(out - 4) = (size_t)out + 5;
 			if (context && context->eip <= (DWORD)out)
 			{
 				context->esp += 8;
@@ -1630,13 +1723,13 @@ done_prefix:
 			break;
 		}
 
-		case INST_RET:
+		case HANDLER_RET:
 		{
 			dbt_gen_ret_trampoline(&out, context);
 			goto end_block;
 		}
 
-		case INST_RETN:
+		case HANDLER_RETN:
 		{
 			int count = parse_word(&code);
 			/* pop [esp - 4 + count] */
@@ -1655,7 +1748,7 @@ done_prefix:
 			goto end_block;
 		}
 
-		case INST_JMP_DIRECT:
+		case HANDLER_JMP_DIRECT:
 		{
 			int32_t rel = parse_rel(&code, ins.imm_bytes);
 			size_t dest = (size_t)code + rel;
@@ -1669,9 +1762,9 @@ done_prefix:
 			goto end_block;
 		}
 
-		case INST_JMP_INDIRECT:
+		case HANDLER_JMP_INDIRECT:
 		{
-			if (ins.segment_prefix == PREFIX_GS && ins.desc->has_modrm && modrm_rm_is_m(ins.rm))
+			if (ins.segment_prefix == PREFIX_GS && ins.has_modrm && modrm_rm_is_m(ins.rm))
 			{
 				/* jmp with effective gs segment override */
 				int temp_reg = find_unused_register(&ins);
@@ -1694,24 +1787,9 @@ done_prefix:
 			goto end_block;
 		}
 
-		case INST_JCC + 0:
-		case INST_JCC + 1:
-		case INST_JCC + 2:
-		case INST_JCC + 3:
-		case INST_JCC + 4:
-		case INST_JCC + 5:
-		case INST_JCC + 6:
-		case INST_JCC + 7:
-		case INST_JCC + 8:
-		case INST_JCC + 9:
-		case INST_JCC + 10:
-		case INST_JCC + 11:
-		case INST_JCC + 12:
-		case INST_JCC + 13:
-		case INST_JCC + 14:
-		case INST_JCC + 15:
+		case HANDLER_JCC:
 		{
-			int cond = GET_JCC_COND(ins.desc->type);
+			int cond = ins.opcode & 0x0F;
 			int32_t rel = parse_rel(&code, ins.imm_bytes);
 			size_t dest0 = (size_t)code + rel; /* Branch taken */
 			size_t dest1 = (size_t)code; /* Branch not taken */
@@ -1737,7 +1815,7 @@ done_prefix:
 			goto end_block;
 		}
 
-		case INST_JCC_REL8:
+		case HANDLER_JCC_REL8:
 		{
 			int32_t rel = parse_rel(&code, ins.imm_bytes);
 			size_t dest0 = (size_t)code + rel; /* Branch taken */
@@ -1771,7 +1849,7 @@ done_prefix:
 			goto end_block;
 		}
 
-		case INST_INT:
+		case HANDLER_INT:
 		{
 			uint8_t id = parse_byte(&code);
 			if (id != 0x80)
@@ -1790,7 +1868,7 @@ done_prefix:
 			goto end_block;
 		}
 
-		case INST_MOV_FROM_SEG:
+		case HANDLER_MOV_FROM_SEG:
 		{
 			if (ins.r != 5) /* GS */
 			{
@@ -1829,7 +1907,7 @@ done_prefix:
 			break;
 		}
 
-		case INST_MOV_TO_SEG:
+		case HANDLER_MOV_TO_SEG:
 		{
 			/* TODO: Fix context */
 			if (ins.r != 5) /* GS */
@@ -1859,7 +1937,7 @@ done_prefix:
 			gen_push_rm(&out, modrm_rm_reg(2));
 			gen_push_rm(&out, modrm_rm_reg(temp_reg));
 			gen_call(&out, &tls_user_entry_to_offset);
-			
+
 			/* mov temp_reg, fs:eax */
 			gen_fs_prefix(&out);
 			gen_mov_r_rm_32(&out, temp_reg, modrm_rm_mreg(0, 0));
@@ -1880,8 +1958,8 @@ done_prefix:
 			gen_mov_r_rm_32(&out, temp_reg, modrm_rm_disp(dbt_global->tls_scratch_offset));
 			break;
 		}
-		
-		case INST_CPUID:
+
+		case HANDLER_CPUID:
 		{
 			/* TODO: Fix context */
 			gen_call(&out, &dbt_cpuid_internal);
@@ -1905,7 +1983,15 @@ static uint8_t *dbt_find(size_t pc)
 	{
 		struct dbt_block *block = slist_entry(cur, struct dbt_block, list);
 		if (block->pc == pc)
+		{
+			if (cmdline_flags->dbt_trace_all)
+			{
+				dbt_save_simd_state();
+				log_debug("dbt_find: block pc: %p, translated pc: %p, end: %p", block->pc, block->start, dbt->end);
+				dbt_restore_simd_state();
+			}
 			return block->start;
+		}
 	}
 
 	/* Block not found, translate it now */
@@ -1922,8 +2008,13 @@ void dbt_find_next(size_t pc)
 void dbt_find_next_sieve(size_t pc)
 {
 	uint8_t *target = dbt_find(pc);
+	if (cmdline_flags->dbt_trace_all)
+	{
+		/* Do not do any optimizations */
+		dbt_set_return_addr(pc, (size_t)target);
+		return;
+	}
 	uint8_t *sieve = dbt_gen_sieve(pc, target);
-
 	/* Patch sieve table */
 	int hash = SIEVE_HASH(pc);
 	if (dbt->sieve_table[hash] == (void*)&dbt_sieve_fallback)
@@ -1948,9 +2039,13 @@ void dbt_find_next_sieve(size_t pc)
 void dbt_find_direct(size_t pc, size_t patch_addr)
 {
 	/* Translate or generate the block */
+	dbt_flushed = false;
 	size_t block_start = (size_t)dbt_find(pc);
-	/* Patch the jmp/call address so we don't need to repeat work again */
-	*(size_t*)patch_addr = (intptr_t)(block_start - (patch_addr + 4)); /* Relative address */
+	if (!dbt_flushed && !cmdline_flags->dbt_trace_all)
+	{
+		/* Patch the jmp/call address so we don't need to repeat work again */
+		*(size_t*)patch_addr = (intptr_t)(block_start - (patch_addr + 4)); /* Relative address */
+	}
 	dbt_set_return_addr(pc, block_start);
 }
 

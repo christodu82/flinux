@@ -1,7 +1,7 @@
 /*
  * This file is part of Foreign Linux.
  *
- * Copyright (C) 2014, 2015 Xiangyan Sun <wishstudio@gmail.com>
+ * Copyright (C) 2015, 2016 Xiangyan Sun <wishstudio@gmail.com>
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,17 +19,15 @@
 
 #pragma once
 
-#include <fs/file.h>
-#include <fs/virtual.h>
+#define GetPhysicalXY(X, Y) GetPhysicalX(X), GetPhysicalY(Y)
 
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
+class DPIAware
+{
+protected:
+	void Init(HWND hWnd);
+	int GetPhysicalX(int logicalX);
+	int GetPhysicalY(int logicalY);
 
-void console_init();
-int console_fork(HANDLE process);
-void console_afterfork();
-
-struct virtualfs_custom_desc console_desc;
-size_t console_read(void *buf, size_t count);
-size_t console_write(const void *buf, size_t count);
-struct file *console_alloc();
+private:
+	int m_dpix, m_dpiy;
+};

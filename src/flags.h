@@ -19,17 +19,21 @@
 
 #pragma once
 
-#include <fs/file.h>
-#include <fs/virtual.h>
+#include <stdbool.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
+#define MAX_SESSION_ID_LEN	8
+#define DEFAULT_SESSION_ID	"default"
 
-void console_init();
-int console_fork(HANDLE process);
-void console_afterfork();
+struct _flags
+{
+	char global_session_id[MAX_SESSION_ID_LEN];
+	/* DBT flags */
+	bool dbt_trace;
+	bool dbt_trace_all;
+};
 
-struct virtualfs_custom_desc console_desc;
-size_t console_read(void *buf, size_t count);
-size_t console_write(const void *buf, size_t count);
-struct file *console_alloc();
+extern struct _flags *cmdline_flags;
+
+void flags_init();
+void flags_afterfork_parent();
+void flags_afterfork_child();

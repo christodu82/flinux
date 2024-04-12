@@ -17,6 +17,7 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <fs/console.h>
 #include <str.h>
 #include <vsprintf.h>
 #include <vsscanf.h>
@@ -33,10 +34,7 @@ int kprintf(const char *format, ...)
 	va_list ap;
 	va_start(ap, format);
 	int size = kvsprintf(buffer, format, ap);
-	HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
-	WriteFile(handle, buffer, size, NULL, NULL);
-	FlushFileBuffers(handle);
-	return size;
+	return console_write(buffer, size);
 }
 
 int ksprintf(char *buf, const char *format, ...)
@@ -342,7 +340,7 @@ int utf8_to_utf16_filename(const char *data, int srclen, uint16_t *outdata, int 
 			uint32_t codepoint = utf8_read_increment(&data, last);
 			if (codepoint == -1)
 				return -1;
-			if (codepoint <= 0x80)
+			if (codepoint <= 0x7F)
 				codepoint = filename_transform_chars[codepoint];
 			outlen += utf16_count_len(codepoint);
 		}
@@ -393,7 +391,9 @@ int utf16_to_utf8_filename(const uint16_t *data, int srclen, char *outdata, int 
 			uint32_t codepoint = utf16_read_increment(&data, last);
 			if (codepoint == -1)
 				return -1;
-			if (filename_transform_chars[codepoint & 0x7F] == codepoint)
+			if (codepoint == '\\')
+				codepoint = '/';
+			else if (filename_transform_chars[codepoint & 0x7F] == codepoint)
 				codepoint &= 0x7F;
 			int r = utf8_write_increment(codepoint, &outdata, outlast);
 			if (r < 0)

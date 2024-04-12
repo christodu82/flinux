@@ -19,17 +19,9 @@
 
 #pragma once
 
-#include <fs/file.h>
-#include <fs/virtual.h>
-
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
-void console_init();
-int console_fork(HANDLE process);
-void console_afterfork();
-
-struct virtualfs_custom_desc console_desc;
-size_t console_read(void *buf, size_t count);
-size_t console_write(const void *buf, size_t count);
-struct file *console_alloc();
+int futex_wait(volatile int *addr, int val, DWORD timeout);
+int futex_wake(int *addr, int count);
+int futex_requeue(int *addr, int count, int *requeue_addr, int *requeue_val);

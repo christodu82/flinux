@@ -9,6 +9,8 @@ typedef LONG NTSTATUS;
 #define STATUS_SUCCESS					0x00000000
 #define STATUS_OBJECT_NAME_EXISTS		0x40000000
 #define STATUS_NO_MORE_FILES			0x80000006
+#define STATUS_CONFLICTING_ADDRESSES	0xC0000018
+#define STATUS_NOT_MAPPED_VIEW			0xC0000019
 #define STATUS_ACCESS_DENIED			0xC0000022
 #define STATUS_OBJECT_NAME_COLLISION	0xC0000035
 #define STATUS_SHARING_VIOLATION		0xC0000043
@@ -86,9 +88,26 @@ typedef struct _OBJECT_ATTRIBUTES {
 	PVOID           SecurityQualityOfService;
 } OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
 
+#define InitializeObjectAttributes( \
+	_InitializedAttributes, \
+	_ObjectName, \
+	_Attributes, \
+	_RootDirectory, \
+	_SecurityDescriptor) \
+	do \
+	{ \
+		(_InitializedAttributes)->Length = sizeof(OBJECT_ATTRIBUTES); \
+		(_InitializedAttributes)->RootDirectory = _RootDirectory; \
+		(_InitializedAttributes)->Attributes = _Attributes; \
+		(_InitializedAttributes)->ObjectName = _ObjectName; \
+		(_InitializedAttributes)->SecurityDescriptor = _SecurityDescriptor; \
+		(_InitializedAttributes)->SecurityQualityOfService = NULL; \
+	} while (0)
+
 typedef enum _OBJECT_INFORMATION_CLASS {
-	ObjectBasicInformation = 0,
-	ObjectTypeInformation = 2
+	ObjectBasicInformation,
+	ObjectNameInformation,
+	ObjectTypeInformation
 } OBJECT_INFORMATION_CLASS;
 
 typedef struct _OBJECT_BASIC_INFORMATION {
@@ -99,12 +118,27 @@ typedef struct _OBJECT_BASIC_INFORMATION {
 	ULONG       Reserved[10];
 } OBJECT_BASIC_INFORMATION, *POBJECT_BASIC_INFORMATION;
 
+typedef struct _OBJECT_NAME_INFORMATION {
+	UNICODE_STRING	Name;
+	WCHAR			NameBuffer[0];
+} OBJECT_NAME_INFORMATION, *POBJECT_NAME_INFORMATION;
+
 NTSYSAPI NTSTATUS NTAPI NtQueryObject(
 	_In_opt_	HANDLE Handle,
 	_In_		OBJECT_INFORMATION_CLASS ObjectInformationClass,
 	_Out_opt_	PVOID ObjectInformation,
 	_In_		ULONG ObjectInformationLength,
 	_Out_opt_	PULONG ReturnLength
+	);
+
+NTSYSAPI NTSTATUS NTAPI NtDuplicateObject(
+	_In_		HANDLE SourceProcessHandle,
+	_In_		HANDLE SourceHandle,
+	_In_opt_	HANDLE TargetProcessHandle,
+	_Out_opt_	PHANDLE TargetHandle,
+	_In_		ACCESS_MASK DesiredAccess,
+	_In_		ULONG HandleAttributes,
+	_In_		ULONG Options
 	);
 
 NTSYSAPI NTSTATUS NTAPI NtClose(
@@ -180,6 +214,42 @@ NTSYSAPI NTSTATUS NTAPI NtQuerySystemInformation(
 	_Inout_		PVOID SystemInformation,
 	_In_		ULONG SystemInformationLength,
 	_Out_opt_	PULONG ReturnLength
+	);
+
+/* Event objects */
+typedef enum _EVENT_TYPE {
+	NotificationEvent,
+	SynchronizationEvent
+} EVENT_TYPE;
+
+NTSYSAPI NTSTATUS NTAPI NtCreateEvent(
+	_Out_		PHANDLE EventHandle,
+	_In_		ACCESS_MASK DesiredAccess,
+	_In_opt_	POBJECT_ATTRIBUTES ObjectAttributes,
+	_In_		EVENT_TYPE EventType,
+	_In_		BOOLEAN InitialState
+	);
+
+NTSYSAPI NTSTATUS NTAPI NtSetEvent(
+	_In_		HANDLE EventHandle,
+	_Out_opt_	PULONG PreviousState
+	);
+
+NTSYSAPI NTSTATUS NTAPI NtClearEvent(
+	_In_		HANDLE EventHandle
+	);
+
+/* Mutant objects */
+NTSYSAPI NTSTATUS NTAPI NtCreateMutant(
+	_Out_		PHANDLE MutantHandle,
+	_In_		ACCESS_MASK DesiredAccess,
+	_In_		POBJECT_ATTRIBUTES ObjectAttributes,
+	_In_		BOOLEAN InitialOwner
+	);
+
+NTSYSAPI NTSTATUS NTAPI NtReleaseMutant(
+	_In_		HANDLE MutantHandle,
+	_Out_opt_	PULONG PreviousState
 	);
 
 /* File API */
@@ -313,6 +383,11 @@ typedef struct _FILE_INTERNAL_INFORMATION {
 	LARGE_INTEGER IndexNumber;
 } FILE_INTERNAL_INFORMATION, *PFILE_INTERNAL_INFORMATION;
 
+typedef struct _FILE_NAME_INFORMATION {
+	ULONG FileNameLength;
+	WCHAR FileName[1];
+} FILE_NAME_INFORMATION, *PFILE_NAME_INFORMATION;
+
 typedef struct _FILE_RENAME_INFORMATION {
 	BOOLEAN ReplaceIfExists;
 	HANDLE  RootDirectory;
@@ -334,6 +409,24 @@ typedef struct _FILE_DISPOSITION_INFORMATION {
 typedef struct _FILE_END_OF_FILE_INFORMATION {
 	LARGE_INTEGER EndOfFile;
 } FILE_END_OF_FILE_INFORMATION, *PFILE_END_OF_FILE_INFORMATION;
+
+/* NamedPipeState */
+#define FILE_PIPE_DISCONNECTED_STATE	0x00000001
+#define FILE_PIPE_LISTENING_STATE		0x00000002
+#define FILE_PIPE_CONNECTED_STATE		0x00000003
+#define FILE_PIPE_CLOSING_STATE			0x00000004
+typedef struct _FILE_PIPE_LOCAL_INFORMATION {
+	ULONG NamedPipeType;
+	ULONG NamedPipeConfiguration;
+	ULONG MaximumInstances;
+	ULONG CurrentInstances;
+	ULONG InboundQuota;
+	ULONG ReadDataAvailable;
+	ULONG OutboundQuota;
+	ULONG WriteQuotaAvailable;
+	ULONG NamedPipeState;
+	ULONG NamedPipeEnd;
+} FILE_PIPE_LOCAL_INFORMATION, *PFILE_PIPE_LOCAL_INFORMATION;
 
 typedef struct _FILE_ATTRIBUTE_TAG_INFORMATION {
 	ULONG FileAttributes;
@@ -370,6 +463,19 @@ NTSYSAPI NTSTATUS NTAPI NtSetInformationFile(
 	_In_		PVOID FileInformation,
 	_In_		ULONG Length,
 	_In_		FILE_INFORMATION_CLASS FileInformationClass
+	);
+
+/* Directory */
+#define DIRECTORY_QUERY					0x0001
+#define DIRECTORY_TRAVERSE				0x0002
+#define DIRECTORY_CREATE_OBJECT			0x0004
+#define DIRECTORY_CREATE_SUBDIRECTORY	0x0008
+#define DIRECTORY_ALL_ACCESS			(STANDARD_RIGHTS_REQUIRED | 0xF)
+
+NTSYSAPI NTSTATUS NTAPI NtCreateDirectoryObject(
+	_Out_		PHANDLE DirectoryHandle,
+	_In_		ACCESS_MASK DesiredAccess,
+	_In_		POBJECT_ATTRIBUTES ObjectAttributes
 	);
 
 NTSYSAPI NTSTATUS NTAPI NtQueryDirectoryFile(
@@ -449,6 +555,23 @@ NTSYSAPI NTSTATUS NTAPI NtSetEaFile(
 	_Out_		PIO_STATUS_BLOCK IoStatusBlock,
 	_In_		PVOID Buffer,
 	_In_		ULONG Length
+	);
+
+/* Virtual memory */
+NTSYSAPI NTSTATUS NTAPI NtWriteVirtualMemory(
+	_In_		HANDLE ProcessHandle,
+	_In_		PVOID BaseAddress,
+	_In_		PVOID Buffer,
+	_In_		SIZE_T NumberOfBytesToWrite,
+	_Out_opt_	PSIZE_T NumberOfBytesWritten
+	);
+
+NTSYSAPI NTSTATUS NTAPI NtProtectVirtualMemory(
+	_In_		HANDLE ProcessHandle,
+	_Inout_		PVOID *BaseAddress,
+	_Inout_		SIZE_T *NumberOfBytesToProtect,
+	_In_		ULONG NewAccessProtection,
+	_Out_		PULONG OldAccessProtection
 	);
 
 /* Section object */
@@ -591,6 +714,27 @@ NTSYSAPI NTSTATUS NTAPI NtQueryInformationThread(
 	_Out_opt_	PULONG ReturnLength
 	);
 
+/* Process */
+NTSYSAPI NTSTATUS NTAPI NtTerminateProcess(
+	_In_opt_	HANDLE ProcessHandle,
+	_In_		NTSTATUS ExitStatus
+	);
+
+/* Token */
+NTSYSAPI NTSTATUS NTAPI NtOpenProcessToken(
+	_In_		HANDLE ProcessHandle,
+	_In_		ACCESS_MASK DesiredAccess,
+	_Out_		PHANDLE TokenHandle
+	);
+
+NTSYSAPI NTSTATUS NTAPI NtQueryInformationToken(
+	_In_		HANDLE TokenHandle,
+	_In_		TOKEN_INFORMATION_CLASS TokenInformationClass,
+	_Out_		PVOID TokenInformation,
+	_In_		ULONG TokenInformationLength,
+	_Out_		PULONG ReturnLength
+	);
+
 /* RTL functions */
 #define HASH_STRING_ALGORITHM_DEFAULT	0
 #define HASH_STRING_ALGORITHM_X65599	1
@@ -634,6 +778,11 @@ NTSYSAPI NTSTATUS NTAPI RtlIntegerToUnicodeString(
 	_In_		ULONG Value,
 	_In_opt_	ULONG Base,
 	_Inout_		PUNICODE_STRING String
+	);
+
+NTSYSAPI NTSTATUS NTAPI RtlInitAnsiString(
+	_Out_		PANSI_STRING DestinationString,
+	_In_opt_	PCSTR SourceString
 	);
 
 /* Helper routines */
@@ -687,3 +836,18 @@ _inline NTSTATUS RtlAppendIntegerToString(
 	RtlIntegerToUnicodeString(Value, Base, &str);
 	return RtlAppendUnicodeStringToString(String, &str);
 }
+
+/* Ldr Functions */
+NTSYSAPI NTSTATUS NTAPI LdrLoadDll(
+	_In_opt_	PWCHAR PathToFile,
+	_In_		PWSTR Flags,
+	_In_		PUNICODE_STRING ModuleFileName,
+	_Out_		PHANDLE ModuleHandle
+	);
+
+NTSYSAPI NTSTATUS NTAPI LdrGetProcedureAddress(
+	_In_		HANDLE ModuleHandle,
+	_In_opt_	PANSI_STRING FunctionName,
+	_In_		WORD Ordinal,
+	_Out_		PVOID *FunctionAddress
+	);

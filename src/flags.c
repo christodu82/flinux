@@ -17,19 +17,22 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
  */
 
-#pragma once
+#include <syscall/mm.h>
+#include <flags.h>
 
-#include <fs/file.h>
-#include <fs/virtual.h>
+struct _flags *cmdline_flags;
 
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
+void flags_init()
+{
+	cmdline_flags = (struct _flags *)mm_static_alloc(sizeof(struct _flags));
+	strcpy(cmdline_flags->global_session_id, DEFAULT_SESSION_ID);
+}
 
-void console_init();
-int console_fork(HANDLE process);
-void console_afterfork();
+void flags_afterfork_parent()
+{
+}
 
-struct virtualfs_custom_desc console_desc;
-size_t console_read(void *buf, size_t count);
-size_t console_write(const void *buf, size_t count);
-struct file *console_alloc();
+void flags_afterfork_child()
+{
+	cmdline_flags = (struct _flags *)mm_static_alloc(sizeof(struct _flags));
+}

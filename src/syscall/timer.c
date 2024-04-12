@@ -23,6 +23,7 @@
 #include <syscall/timer.h>
 #include <datetime.h>
 #include <log.h>
+#include <win7compat.h>
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
@@ -44,20 +45,27 @@ DEFINE_SYSCALL(time, intptr_t *, c)
 DEFINE_SYSCALL(gettimeofday, struct timeval *, tv, struct timezone *, tz)
 {
 	log_info("gettimeofday(0x%p, 0x%p)", tv, tz);
-	if (tz)
-		log_error("warning: timezone is not NULL");
+	if (tv && !mm_check_write(tv, sizeof(struct linux_timeval)))
+		return -L_EFAULT;
+	if (tz && !mm_check_write(tz, sizeof(struct timezone)))
+		return -L_EFAULT;
 	if (tv)
 	{
 		FILETIME system_time;
-		GetSystemTimePreciseAsFileTime(&system_time);
+		win7compat_GetSystemTimePreciseAsFileTime(&system_time);
 		filetime_to_unix_timeval(&system_time, tv);
+	}
+	if (tz)
+	{
+		tz->tz_minuteswest = 0;
+		tz->tz_dsttime = 0;
 	}
 	return 0;
 }
 
 DEFINE_SYSCALL(nanosleep, const struct timespec *, req, struct timespec *, rem)
 {
-	log_info("nanospeep(0x%p, 0x%p)", req, rem);
+	log_info("nanosleep(0x%p, 0x%p)", req, rem);
 	if (!mm_check_read(req, sizeof(struct timespec)) || rem && !mm_check_write(rem, sizeof(struct timespec)))
 		return -L_EFAULT;
 	LARGE_INTEGER delay_interval;
@@ -76,7 +84,7 @@ DEFINE_SYSCALL(clock_gettime, int, clk_id, struct timespec *, tp)
 	case CLOCK_REALTIME:
 	{
 		FILETIME system_time;
-		GetSystemTimePreciseAsFileTime(&system_time);
+		win7compat_GetSystemTimePreciseAsFileTime(&system_time);
 		filetime_to_unix_timespec(&system_time, tp);
 		return 0;
 	}

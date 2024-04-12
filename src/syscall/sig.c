@@ -179,9 +179,10 @@ static void signal_thread_handle_kill(struct siginfo *info)
 
 static void signal_thread_handle_child_terminated(struct child_process *proc)
 {
+	CloseHandle(proc->hPipe);
 	struct siginfo info;
 	info.si_signo = SIGCHLD;
-	info.si_code = 0;
+	info.si_code = SI_KERNEL;
 	info.si_errno = 0;
 	signal_thread_handle_kill(&info);
 	proc->terminated = true;
@@ -443,6 +444,12 @@ void signal_init()
 {
 	/* Initialize signal structures */
 	signal = mm_static_alloc(sizeof(struct signal_data));
+	signal_reset();
+	signal_init_private();
+}
+
+void signal_reset()
+{
 	for (int i = 0; i < _NSIG; i++)
 	{
 		signal->actions[i].sa_sigaction = NULL;
@@ -450,7 +457,6 @@ void signal_init()
 		signal->actions[i].sa_flags = 0;
 		signal->actions[i].sa_restorer = NULL;
 	}
-	signal_init_private();
 }
 
 void signal_afterfork_child()
@@ -490,9 +496,15 @@ void signal_init_thread(struct thread *thread)
 	thread->can_accept_signal = true;
 }
 
+void signal_exit_thread(struct thread *thread)
+{
+	CloseHandle(thread->sigevent);
+	thread->can_accept_signal = false;
+}
+
 int signal_kill(pid_t pid, siginfo_t *info)
 {
-	if (pid == GetCurrentProcessId())
+	if (pid == process->pid)
 	{
 		struct signal_packet packet;
 		packet.type = SIGNAL_PACKET_KILL;
@@ -593,7 +605,16 @@ DEFINE_SYSCALL(alarm, unsigned int, seconds)
 DEFINE_SYSCALL(kill, pid_t, pid, int, sig)
 {
 	log_info("kill(%d, %d)", pid, sig);
-	log_error("kill() not implemented.");
+	if (pid <= 0)
+		log_error("pid <= 0 not implemented.");
+	else
+	{
+		struct siginfo info;
+		info.si_signo = sig;
+		info.si_code = SI_USER;
+		info.si_errno = 0;
+		signal_kill(pid, &info);
+	}
 	return 0;
 }
 
@@ -693,5 +714,5 @@ DEFINE_SYSCALL(sigaltstack, const stack_t *, ss, stack_t *, oss)
 {
 	log_info("sigaltstack(ss=%p, oss=%p)", ss, oss);
 	log_error("sigaltstack() not implemented.");
-	return -L_ENOSYS;
+	return 0;
 }

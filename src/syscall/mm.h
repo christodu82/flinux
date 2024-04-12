@@ -22,6 +22,7 @@
 #include <common/types.h>
 #include <common/mman.h>
 
+#include <stdbool.h>
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
 
@@ -54,11 +55,11 @@
 #define INTERNAL_MAP_NORESET		4	/* Don't unmap the memory region at mm_reset() */
 #define INTERNAL_MAP_VIRTUALALLOC	8	/* This will cause the memory region to be allocated via VirtualAlloc() */
 #define INTERNAL_MAP_SHARED			16	/* A MAP_SHARED memory region */
-#define INTERNAL_MAP_COPYONFORK		32	/* Copy the memory region on forking instead of using CoW */
 /* Macro to test if the given internal flags require block aligned memory region to be allocated */
-#define BLOCK_ALIGNED(flag)			((flag & INTERNAL_MAP_VIRTUALALLOC) || (flag & INTERNAL_MAP_SHARED) || (flag & INTERNAL_MAP_COPYONFORK))
+#define BLOCK_ALIGNED(flag)			((flag & INTERNAL_MAP_VIRTUALALLOC) || (flag & INTERNAL_MAP_SHARED))
 
 void mm_init();
+void mm_init_global_shared();
 void mm_reset();
 void mm_shutdown();
 void mm_update_brk(void *brk);
@@ -66,13 +67,14 @@ void mm_update_brk(void *brk);
 void mm_dump_stack_trace(PCONTEXT context);
 void mm_dump_windows_memory_mappings(HANDLE process);
 void mm_dump_memory_mappings();
+int mm_get_maps(char *buf);
 
 /* Check if the memory region is compatible with desired access */
 int mm_check_read(const void *addr, size_t size);
 int mm_check_read_string(const char *addr);
 int mm_check_write(void *addr, size_t size);
 
-int mm_handle_page_fault(void *addr);
+int mm_handle_page_fault(void *addr, bool is_write);
 int mm_fork(HANDLE process);
 void mm_afterfork_parent();
 void mm_afterfork_child();
@@ -97,10 +99,3 @@ void mm_populate(void *addr);
  */
 #define MM_STATIC_ALLOC_SIZE	3 * BLOCK_SIZE	/* The total size */
 void *mm_static_alloc(size_t size);
-
-/* Static allocation for globally shared area
- * Currently the users of this API should make sure to work with zero initialization
- * Because they do not have any chance of manually initialize their shared data area
- */
-#define MM_GLOBAL_SHARED_ALLOC_SIZE		3 * BLOCK_SIZE
-void *mm_global_shared_alloc(size_t size);
